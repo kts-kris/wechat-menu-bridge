@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - 模型预设表单
@@ -110,6 +111,7 @@ struct V2SettingsView: View {
     @ObservedObject private var settings: SettingsStore
     @State private var editingPreset: PresetForm?
     @State private var pendingPresetRemoval: ModelPreset?
+    @State private var scrollNonce = 0
 
     init(workspace: V2Workspace) {
         self.workspace = workspace
@@ -130,13 +132,11 @@ struct V2SettingsView: View {
                     LegacyProfileNoticeCard(workspace: workspace)
                 }
                 .formStyle(.grouped)
-                // 菜单栏的更新提示跳到本页后，等表单完成布局再滚动。
-                .task(id: workspace.updateSectionRequested) {
-                    guard workspace.updateSectionRequested else { return }
-                    workspace.updateSectionRequested = false
-                    try? await Task.sleep(nanoseconds: 80_000_000)
-                    withAnimation { proxy.scrollTo(UpdateSettingsCard.anchor, anchor: .top) }
-                }
+                .background(SettingsScrollHelper(nonce: scrollNonce))
+                // 不能在 .task(id: updateSectionRequested) 内直接复位该状态，否则会自我取消任务；
+                // 改为独立单调序号驱动，并由 AppKit 兜底，兼容 macOS 分组表单的 ScrollViewReader 限制。
+                .onAppear { consumeUpdateScroll(proxy) }
+                .onChange(of: workspace.updateSectionRequested) { _ in consumeUpdateScroll(proxy) }
             }
             UnsavedChangesBar(workspace: workspace)
         }
@@ -155,6 +155,66 @@ struct V2SettingsView: View {
 
     private var removalDialog: Binding<Bool> {
         Binding(get: { pendingPresetRemoval != nil }, set: { if !$0 { pendingPresetRemoval = nil } })
+    }
+
+    private func consumeUpdateScroll(_ proxy: ScrollViewProxy) {
+        guard workspace.updateSectionRequested else { return }
+        workspace.updateSectionRequested = false
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            withAnimation { proxy.scrollTo(UpdateSettingsCard.anchor, anchor: .top) }
+            scrollNonce &+= 1
+        }
+    }
+}
+
+// macOS 分组 Form 内部使用 AppKit NSScrollView，SwiftUI ScrollViewReader 偶发不生效时由此兜底滚到更新区。
+private struct SettingsScrollHelper: NSViewRepresentable {
+    let nonce: Int
+
+    final class Coordinator {
+        var lastNonce = 0
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        guard nonce != context.coordinator.lastNonce else { return }
+        context.coordinator.lastNonce = nonce
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            guard let root = nsView.window?.contentView else { return }
+            Self.scrollFormToUpdateSection(in: root)
+        }
+    }
+
+    private static func scrollFormToUpdateSection(in root: NSView) {
+        func findScrollViews(_ view: NSView) -> [NSScrollView] {
+            (view as? NSScrollView).map { [$0] } ?? view.subviews.flatMap(findScrollViews)
+        }
+        func findByIdentifier(_ view: NSView, id: String) -> NSView? {
+            if view.accessibilityIdentifier() == id { return view }
+            for sub in view.subviews {
+                if let match = findByIdentifier(sub, id: id) { return match }
+            }
+            return nil
+        }
+        guard let scrollView = findScrollViews(root).max(by: {
+            ($0.documentView?.frame.height ?? 0) < ($1.documentView?.frame.height ?? 0)
+        }), let documentView = scrollView.documentView else { return }
+        let clipView = scrollView.contentView
+        guard clipView.bounds.origin.y < 100 else { return }
+        let maxY = max(0, documentView.frame.height - clipView.bounds.height)
+        guard maxY > 0 else { return }
+        let targetY: CGFloat
+        if let anchorView = findByIdentifier(documentView, id: "update-channel") {
+            let rect = anchorView.convert(anchorView.bounds, to: documentView)
+            targetY = min(maxY, max(0, rect.minY - 64))
+        } else {
+            targetY = maxY
+        }
+        clipView.scroll(to: NSPoint(x: 0, y: targetY))
+        scrollView.reflectScrolledClipView(clipView)
     }
 }
 

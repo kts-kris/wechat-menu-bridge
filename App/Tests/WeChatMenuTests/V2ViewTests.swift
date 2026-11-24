@@ -447,6 +447,13 @@ final class V2ViewTests: XCTestCase {
         seededSettings(workspace)
         let host = render(FeedbackSheet(workspace: workspace) {}, size: CGSize(width: 600, height: 640))
         XCTAssertLessThanOrEqual(host.fittingSize.width, 600)
+        XCTAssertEqual(DiagnosticBundleBuilder.defaultRepository, "kts-kris/wechat-menu-bridge")
+        let defaultURL = try XCTUnwrap(DiagnosticBundleBuilder.issueURL(
+            repository: DiagnosticBundleBuilder.defaultRepository,
+            snapshot: diagnosticSnapshot(),
+            feedback: FeedbackDraft(category: .model, title: "默认仓库测试", details: "验证默认预填")
+        ))
+        XCTAssertEqual(defaultURL.path, "/kts-kris/wechat-menu-bridge/issues/new")
     }
 
     func testConversationStatusDotPriority() {

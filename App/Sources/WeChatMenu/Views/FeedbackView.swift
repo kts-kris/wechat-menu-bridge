@@ -219,6 +219,8 @@ enum DiagnosticBundleBuilder {
 
     // MARK: Issue
 
+    static let defaultRepository = "kts-kris/wechat-menu-bridge"
+
     // 接受 owner/repo、GitHub 网址和 SSH 地址。
     static func repositorySlug(_ input: String) -> String? {
         var value = input.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -277,7 +279,7 @@ struct FeedbackSheet: View {
     @ObservedObject var workspace: V2Workspace
     let dismiss: () -> Void
 
-    @AppStorage(Self.repositoryKey) private var repository = ""
+    @AppStorage(Self.repositoryKey) private var repository = DiagnosticBundleBuilder.defaultRepository
     @State private var draft = FeedbackDraft()
     @State private var snapshot: DiagnosticSnapshot
     @State private var logLines: [String] = []
@@ -294,8 +296,13 @@ struct FeedbackSheet: View {
         DiagnosticBundleBuilder.buildReport(snapshot: snapshot, logLines: logLines, feedback: draft)
     }
 
+    private var effectiveRepository: String {
+        let trimmed = repository.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? DiagnosticBundleBuilder.defaultRepository : trimmed
+    }
+
     private var issueURL: URL? {
-        DiagnosticBundleBuilder.issueURL(repository: repository, snapshot: snapshot, feedback: draft)
+        DiagnosticBundleBuilder.issueURL(repository: effectiveRepository, snapshot: snapshot, feedback: draft)
     }
 
     private var repositoryInvalid: Bool {
@@ -349,7 +356,7 @@ struct FeedbackSheet: View {
                 }
 
                 Section("GitHub Issue") {
-                    TextField("仓库", text: $repository, prompt: Text("owner/repo"))
+                    TextField("仓库", text: $repository, prompt: Text(DiagnosticBundleBuilder.defaultRepository))
                         .font(.callout.monospaced())
                         .accessibilityIdentifier("feedback-repository")
                     if repositoryInvalid {

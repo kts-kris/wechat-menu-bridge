@@ -27,6 +27,7 @@ struct UpdateSettingsCard: View {
             LabeledContent("当前版本") {
                 Text("v\(AppVersion.display)").monospacedDigit().textSelection(.enabled)
             }
+            .id(Self.anchor)
             Picker("更新通道", selection: $updater.channel) {
                 ForEach(UpdateChannel.allCases) { Text($0.title).tag($0) }
             }
@@ -61,7 +62,6 @@ struct UpdateSettingsCard: View {
             details
             HotBundlesRow(status: bundles, busy: bundlesBusy, fault: bundlesFault, ready: runtime.ready, reload: reloadBundles)
         }
-        .id(Self.anchor)
         .task(id: runtime.ready) { await loadBundles() }
     }
 
