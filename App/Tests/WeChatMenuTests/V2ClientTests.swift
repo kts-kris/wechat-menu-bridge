@@ -16,7 +16,7 @@ private enum Golden {
     static let revision = #"{"createdAt":60,"diffPreview":"+ 新条目","revId":"rev-1","scopeKey":"wxid_a","snapshotPath":"memory/history/a.md","source":"proposal_accepted","summary":"整理","targetKind":"scope"}"#
     static let status = #"{"capabilities":\#(capabilities),"globalPhase":"running","pendingProposalCount":2,"plugins":{"p1":\#(pluginState)},"sessions":{"wxid_a":\#(session)},"unreadFeedCount":3}"#
     static let hello = #"{"capabilities":\#(capabilities),"globalPhase":"running","pendingProposalCount":2,"plugins":{"p1":\#(pluginState)},"sessions":{"wxid_a":\#(session)},"unreadFeedCount":3,"v":3}"#
-    static let declarative = #"{"description":"群摘要","enabled":true,"builtinTemplate":"group-digest","id":"p2","name":"摘要","processor":{"maxInputChars":24000,"outputFormat":"structured_digest_json","skipWhenNoValue":true,"systemPrompt":"s","userPromptTemplate":"u"},"rateLimit":{"maxRunsPerHour":4,"maxWeChatSendsPerDay":20},"scope":{"conversationIds":["g@chatroom"],"excludeSelf":true,"includeTypes":["group"],"kinds":["text","recall"]},"sinks":[{"id":"s1","notifyDesktop":true,"type":"app_feed"},{"filenameTemplate":"{{date}}.md","id":"s2","mode":"append","type":"markdown_file"},{"approved":false,"id":"s3","targetConversationId":"filehelper","type":"wechat"},{"hasSecret":true,"id":"s4","type":"webhook","url":"https://hooks.example.invalid/x"}],"trigger":{"everyMinutes":60,"minMessages":5,"timesOfDay":["09:30"],"type":"window_time"}}"#
+    static let declarative = #"{"description":"群摘要","enabled":true,"builtinTemplate":"group-digest","id":"p2","name":"摘要","processor":{"maxInputChars":24000,"outputFormat":"structured_digest_json","skipWhenNoValue":true,"systemPrompt":"s","userPromptTemplate":"u"},"rateLimit":{"maxRunsPerHour":4,"maxWeChatSendsPerDay":20},"scope":{"conversationIds":["g@chatroom"],"excludeSelf":true,"includeTypes":["group"],"kinds":["text","recall"]},"sinks":[{"id":"s1","notifyDesktop":true,"type":"app_feed"},{"filenameTemplate":"{{date}}.md","id":"s2","mode":"append","type":"markdown_file"},{"approved":false,"id":"s3","targetConversationId":"filehelper","type":"wechat"},{"hasSecret":true,"id":"s4","type":"webhook","url":"https://hooks.example.invalid/x"},{"hasSecret":false,"id":"s5","platform":"feishu","type":"webhook","url":"https://open.feishu.cn/open-apis/bot/v2/hook/x"}],"trigger":{"everyMinutes":60,"minMessages":5,"timesOfDay":["09:30"],"type":"window_time"}}"#
     static let trace = #"{"at":80,"conversationId":"wxid_a","detail":"对方连发 3 条","id":"trace-1","level":"warn","stage":"policy","summary":"跳过本轮"}"#
     static let healthCheck = #"{"ok":false,"steps":[{"detail":"已连接","durationMs":12,"id":"xiaohe","label":"小禾连接","ok":true},{"detail":"在白名单内","durationMs":3,"id":"whitelist","label":"发信白名单","ok":true},{"detail":"已读取","durationMs":5,"id":"credentials","label":"本机凭据读取","ok":true},{"detail":"模型返回格式错误","durationMs":4200,"id":"model","label":"云端模型实测","ok":false}]}"#
     static let manifest = #"{"entry":"index.ts","id":"p1","name":"代码插件","permissions":["read_events","call_model","send_wechat"],"version":"1.0.0"}"#
@@ -36,6 +36,8 @@ private enum Golden {
         #"{"kind":"event","payload":\#(payload),"topic":"\#(topic)","v":3}"#
     }
 
+    static let webhookTest = #"{"detail":"飞书已接收","ok":true,"statusCode":200}"#
+
     static let hotBundles = #"{"items":[{"name":"policy.json","sha256":"\#(String(repeating: "a", count: 64))","verified":true}],"lastReloadAt":90,"loadedCount":1,"version":"2026.11.24"}"#
 
     static let results: [RPCMethod: String] = [
@@ -51,7 +53,7 @@ private enum Golden {
         .sessionTraces: #"{"items":[\#(trace)]}"#, .sessionResumeCooldown: "true",
         .pluginsList: #"[{"config":\#(declarative),"kind":"declarative","pluginId":"p2","state":\#(declarativeState)},{"kind":"module","manifest":\#(manifest),"pluginId":"p1","state":\#(pluginState)}]"#,
         .pluginsSaveDeclarative: "true", .pluginsDeleteDeclarative: "true", .pluginsSetEnabled: "true",
-        .pluginsRunNow: #"{"runId":"run-1"}"#,
+        .pluginsRunNow: #"{"runId":"run-1"}"#, .pluginsTestWebhook: webhookTest,
         .pluginsRuns: #"{"items":[{"errorCode":"plugin-limit","finishedAt":71,"itemCount":3,"outputPaths":["outputs/a.md"],"pluginId":"p1","runId":"run-1","startedAt":70,"status":"error","summaryPreview":"预览","triggerKind":"window_count"}],"nextCursor":"c2"}"#,
         .memoryGet: ##"{"path":"memory/persona.md","text":"# 人格"}"##, .memorySave: revision, .memorySetEntryLock: revision,
         .memorySetEntryVisibility: revision, .memoryConsolidateNow: "null",
@@ -203,7 +205,7 @@ final class V2ClientTests: XCTestCase {
     }
 
     func testAllRPCResultsRoundTripGoldenReplies() throws {
-        XCTAssertEqual(RPCMethod.allCases.count, 35)
+        XCTAssertEqual(RPCMethod.allCases.count, 36)
         XCTAssertEqual(Set(Golden.results.keys), Set(RPCMethod.allCases))
         func check<T: Codable>(_ method: RPCMethod, _ type: T.Type) throws {
             let json = Data(try XCTUnwrap(Golden.results[method]).utf8)
@@ -222,6 +224,7 @@ final class V2ClientTests: XCTestCase {
         try check(.systemBundles, HotBundlesStatus.self)
         try check(.pluginsList, [PluginListItem].self)
         try check(.pluginsRuns, IPCPage<PluginRun>.self)
+        try check(.pluginsTestWebhook, WebhookTestResult.self)
         try check(.memoryGet, MemoryContent.self)
         try check(.memorySave, MemoryRevision.self)
         try check(.memoryConsolidateNow, MemoryRevision?.self)
@@ -340,12 +343,97 @@ final class V2ClientTests: XCTestCase {
     func testSystemBundlesSendsActionParam() async throws {
         let (runtime, transport) = try connectedRuntime()
         transport.responder = { method, _ in Golden.results[method] }
-        let status = try await runtime.client.systemBundles(action: "reload")
+        let status = try await runtime.client.systemBundles(action: .reload)
         XCTAssertEqual(status.loadedCount, 1)
         XCTAssertEqual(status.items.first?.id, "policy.json")
         let frame = try XCTUnwrap(transport.frames.last)
         XCTAssertEqual(frame["method"] as? String, "system.bundles")
         XCTAssertEqual((frame["params"] as? [String: Any])?["action"] as? String, "reload")
+        XCTAssertNil((frame["params"] as? [String: Any])?["manifestUrl"], "未指定清单时省略 manifestUrl")
+    }
+
+    @MainActor
+    func testSystemBundlesSyncAndResetParams() async throws {
+        let (runtime, transport) = try connectedRuntime()
+        transport.responder = { method, _ in Golden.results[method] }
+        let manifest = "https://github.com/kts-kris/wechat-menu-bridge/releases/latest/download/bundles-manifest.json"
+        _ = try await runtime.client.systemBundles(action: .sync, manifestUrl: manifest)
+        XCTAssertEqual(transport.params(of: .systemBundles)?["action"] as? String, "sync")
+        XCTAssertEqual(transport.params(of: .systemBundles)?["manifestUrl"] as? String, manifest)
+        _ = try await runtime.client.systemBundles(action: .reset)
+        XCTAssertEqual(transport.params(of: .systemBundles)?.keys.sorted(), ["action"])
+        XCTAssertEqual(transport.params(of: .systemBundles)?["action"] as? String, "reset")
+        XCTAssertEqual(Set(HotBundlesAction.allCases.map(\.rawValue)), ["status", "reload", "sync", "reset"])
+    }
+
+    func testConversationReplyStyleFieldsDefaultAndRoundTrip() throws {
+        // v2.1 的 settings.json 没有这两个键：读成 false，编码后补齐默认值（与 zod default 一致）。
+        let legacy = #"{"conversationId":"g@chatroom","label":"群","type":"group","enabled":true,"replyMode":"draft"}"#
+        let policy = try IPCv3.decodeStrict(ConversationPolicy.self, from: Data(legacy.utf8))
+        XCTAssertFalse(policy.useNativeReply)
+        XCTAssertFalse(policy.mentionReplySender)
+        let encoded = String(decoding: try IPCv3.encoder().encode(policy), as: UTF8.self)
+        XCTAssertTrue(encoded.contains(#""useNativeReply":false"#))
+        XCTAssertTrue(encoded.contains(#""mentionReplySender":false"#))
+
+        let on = legacy.replacingOccurrences(of: #""enabled":true"#, with: #""enabled":true,"mentionReplySender":true,"useNativeReply":true"#)
+        let value = try IPCv3.decodeStrict(ConversationPolicy.self, from: Data(on.utf8))
+        XCTAssertTrue(value.useNativeReply)
+        XCTAssertTrue(value.mentionReplySender)
+        XCTAssertEqual(try IPCv3.decodeStrict(ConversationPolicy.self, from: IPCv3.encoder().encode(value)), value)
+        for bad in [#""useNativeReply":null"#, #""mentionReplySender":"yes""#] {
+            let json = legacy.replacingOccurrences(of: #""enabled":true"#, with: #""enabled":true,\#(bad)"#)
+            XCTAssertThrowsError(try IPCv3.decodeStrict(ConversationPolicy.self, from: Data(json.utf8)), bad)
+        }
+    }
+
+    func testWebhookPlatformAndDailyBriefingContract() throws {
+        XCTAssertEqual(Set(PluginSinkConfig.WebhookPlatform.allCases.map(\.rawValue)), ["generic", "feishu", "wecom", "telegram", "notion"])
+        XCTAssertEqual(DeclarativePluginConfig.BuiltinTemplate.dailyBriefing.rawValue, "daily-briefing")
+
+        let legacy = #"{"hasSecret":true,"id":"s4","type":"webhook","url":"https://hooks.example.invalid/x"}"#
+        let old = try IPCv3.decodeStrict(PluginSinkConfig.self, from: Data(legacy.utf8))
+        XCTAssertEqual(old, .webhook(id: "s4", url: "https://hooks.example.invalid/x", hasSecret: true))
+        XCTAssertTrue(try jsonEqual(IPCv3.encoder().encode(old), Data(legacy.utf8)), "platform 为 nil 时省略")
+        for platform in PluginSinkConfig.WebhookPlatform.allCases {
+            let json = legacy.replacingOccurrences(of: #""id":"s4""#, with: #""id":"s4","platform":"\#(platform.rawValue)""#)
+            let value = try IPCv3.decodeStrict(PluginSinkConfig.self, from: Data(json.utf8))
+            XCTAssertEqual(value, .webhook(id: "s4", url: "https://hooks.example.invalid/x", hasSecret: true, platform: platform))
+            XCTAssertTrue(try jsonEqual(IPCv3.encoder().encode(value), Data(json.utf8)), platform.rawValue)
+        }
+        for bad in [#""platform":null"#, #""platform":"slack""#] {
+            let json = legacy.replacingOccurrences(of: #""id":"s4""#, with: #""id":"s4",\#(bad)"#)
+            XCTAssertThrowsError(try IPCv3.decodeStrict(PluginSinkConfig.self, from: Data(json.utf8)), bad)
+        }
+        let briefing = Golden.declarative.replacingOccurrences(of: #""builtinTemplate":"group-digest""#, with: #""builtinTemplate":"daily-briefing""#)
+        XCTAssertEqual(try IPCv3.decodeStrict(DeclarativePluginConfig.self, from: Data(briefing.utf8)).builtinTemplate, .dailyBriefing)
+    }
+
+    func testWebhookTestResultIsStrict() throws {
+        let minimal = #"{"detail":"连接超时","ok":false}"#
+        let value = try IPCv3.decodeStrict(WebhookTestResult.self, from: Data(minimal.utf8))
+        XCTAssertNil(value.statusCode)
+        XCTAssertTrue(try jsonEqual(IPCv3.encoder().encode(value), Data(minimal.utf8)))
+        for bad in [#"{"detail":"x","ok":true,"statusCode":null}"#, #"{"detail":"x","extra":1,"ok":true}"#, #"{"ok":true}"#] {
+            XCTAssertThrowsError(try IPCv3.decodeStrict(WebhookTestResult.self, from: Data(bad.utf8)), bad)
+        }
+        XCTAssertEqual(RPCMethod.pluginsTestWebhook.rawValue, "plugins.testWebhook")
+    }
+
+    @MainActor
+    func testPluginsTestWebhookSendsParamsWithoutStoringSecret() async throws {
+        let (runtime, transport) = try connectedRuntime()
+        transport.responder = { method, _ in Golden.results[method] }
+        let result = try await runtime.client.pluginsTestWebhook(.init(pluginId: "p2", sinkId: "s5",
+                                                                        url: "https://open.feishu.cn/open-apis/bot/v2/hook/x",
+                                                                        platform: .feishu, secret: "sign-secret"))
+        XCTAssertEqual(result, WebhookTestResult(ok: true, statusCode: 200, detail: "飞书已接收"))
+        let params = try XCTUnwrap(transport.params(of: .pluginsTestWebhook))
+        XCTAssertEqual(params["platform"] as? String, "feishu")
+        XCTAssertEqual(params["secret"] as? String, "sign-secret")
+        _ = try await runtime.client.pluginsTestWebhook(.init(pluginId: "p2", sinkId: "s4", url: "https://hooks.example.invalid/x"))
+        XCTAssertEqual(transport.params(of: .pluginsTestWebhook)?.keys.sorted(), ["pluginId", "sinkId", "url"],
+                       "通用平台与已存密钥都省略可选字段")
     }
 
     func testChatPresetCanBackVisionDefaultThroughSettingsContract() throws {
@@ -400,7 +488,7 @@ final class V2ClientTests: XCTestCase {
         XCTAssertEqual(codes.count, IPCErrorCode.allCases.count)
     }
 
-    // 所有 35 个请求、35 个响应、8 种推送与 v1 迁移结果，都交给引擎的真实 zod schema 校验。
+    // 所有 36 个请求、36 个响应、8 种推送与 v1 迁移结果，都交给引擎的真实 zod schema 校验。
     @MainActor
     func testEveryFrameAgainstEngineZodSchemas() async throws {
         let env = ProcessInfo.processInfo.environment
@@ -426,12 +514,15 @@ final class V2ClientTests: XCTestCase {
         var risk = RiskProfile()
         risk.takeoverAction = .ignore
         risk.selectedLevel = .minimal
-        settings.conversations["g@chatroom"] = ConversationPolicy(conversationId: "g@chatroom", label: "群", type: .group, riskProfile: risk)
+        settings.conversations["g@chatroom"] = ConversationPolicy(conversationId: "g@chatroom", label: "群", type: .group, riskProfile: risk,
+                                                                  useNativeReply: true, mentionReplySender: true)
 
         _ = try await c.systemStatus()
         _ = try await c.systemHealthCheck(presetId: "m2", conversationId: "wxid_a")
-        _ = try await c.systemBundles(action: "status")
-        _ = try await c.systemBundles(action: "reload")
+        _ = try await c.systemBundles(action: .status)
+        _ = try await c.systemBundles(action: .reload)
+        _ = try await c.systemBundles(action: .sync, manifestUrl: "https://github.com/kts-kris/wechat-menu-bridge/releases/latest/download/bundles-manifest.json")
+        _ = try await c.systemBundles(action: .reset)
         _ = try await c.sessionTraces(conversationId: "wxid_a", limit: 40)
         _ = try await c.sessionResumeCooldown(conversationId: "wxid_a")
         try await c.systemPauseAll(scope: .sendingOnly, reason: .userPaused)
@@ -453,6 +544,8 @@ final class V2ClientTests: XCTestCase {
         try await c.pluginsSetEnabled(.init(pluginId: "p1", enabled: true, approvedPermissions: [.readEvents], manifestHash: "hash-1"))
         _ = try await c.pluginsRunNow(.init(pluginId: "p1", conversationId: "wxid_a", range: TimeRange(startTime: 1, endTime: 2)))
         _ = try await c.pluginsRuns(.init(pluginId: "p1", cursor: "c", limit: 10))
+        _ = try await c.pluginsTestWebhook(.init(pluginId: "p2", sinkId: "s5", url: "https://open.feishu.cn/open-apis/bot/v2/hook/x",
+                                                 platform: .feishu, secret: "sign secret"))
         _ = try await c.memoryGet(.persona)
         _ = try await c.memorySave(.scope(conversationId: "wxid_a"), content: MemoryContent(text: "内容", path: "memory/a.md"))
         _ = try await c.memorySetEntryLock(.persona, entryId: "e1", locked: true)

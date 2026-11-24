@@ -12,7 +12,7 @@ import { identityKey, peerKey, routeKey, type HistoryFilter, type Receipt, type 
 import { refHash } from '../src/mcp/ingest.ts';
 import { createGroupDigestPluginTemplate } from '../src/plugins/declarative.ts';
 import { PluginManager, type PluginManagerOptions } from '../src/plugins/manager.ts';
-import { SinkDispatcher, type SinkOutput } from '../src/plugins/sinks.ts';
+import { buildWebhookRequest, feishuSign, SinkDispatcher, type SinkOutput } from '../src/plugins/sinks.ts';
 import { atomicWritePrivateFile, ensurePrivateDir, readPrivateFile } from '../src/storage/fs-safe.ts';
 import { JournalV2 } from '../src/storage/journal-v2.ts';
 
@@ -396,4 +396,187 @@ test('手动 runNow 通过 HistoryBackfiller 补扫时间范围，撤回和回�
     expect(t.wire).toEqual([]);
     expect(t.feeds).toEqual([{ kind: 'plugin_digest', notify: true }]);
   } finally { await t.close(); }
+});
+
+// ---- v2.2.0 #8：常用通知出口平台适配与测试通知 RPC ----
+
+type Captured = { method: string; path: string; search: string; headers: Record<string, string>; body: string };
+function hookServer(respond: (path: string) => Response = () => new Response('{}', { status: 200 })) {
+  const captured: Captured[] = [];
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+    const url = new URL(req.url);
+    captured.push({ method: req.method, path: url.pathname, search: url.search,
+      headers: Object.fromEntries(req.headers.entries()), body: await req.text() });
+    return respond(url.pathname);
+  } });
+  return { captured, base: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
+}
+const webhookOutput = (signal: AbortSignal): SinkOutput => ({
+  pluginId: 'digest', conversationId: group, scopeName: '发布群', title: '群聊摘要', markdown: '**要点**：周三上线',
+  dedupeKey: 'k', maxWeChatSendsPerDay: 0, origin: 'live', signal,
+});
+
+test('v2.2 #8 四个平台的请求体、方法与签名头符合各平台约定', () => {
+  const message = { pluginId: 'digest', conversationId: group, title: '群聊摘要', markdown: '**要点**：周三上线' };
+  const now = 1_764_000_000_123;
+  const url = (raw: string) => new URL(raw);
+
+  const feishu = buildWebhookRequest('feishu', url('https://open.feishu.cn/open-apis/bot/v2/hook/x'), message, 'fs-secret', now);
+  const feishuBody = JSON.parse(feishu.body);
+  expect(feishu.method).toBe('POST');
+  expect(feishuBody).toMatchObject({ msg_type: 'interactive', timestamp: '1764000000',
+    card: { header: { title: { tag: 'plain_text', content: '群聊摘要' } }, elements: [{ tag: 'markdown', content: '**要点**：周三上线' }] } });
+  expect(feishuBody.sign).toBe(createHmac('sha256', '1764000000\nfs-secret').update('').digest('base64'));
+  expect(feishuSign('1764000000', 'fs-secret')).toBe(feishuBody.sign);
+  const unsignedFeishu = JSON.parse(buildWebhookRequest('feishu', url('https://open.feishu.cn/x'), message, undefined, now).body);
+  expect(unsignedFeishu.sign).toBeUndefined();
+  expect(unsignedFeishu.timestamp).toBeUndefined();
+
+  const wecom = buildWebhookRequest('wecom', url('https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=k'), message, undefined, now);
+  expect(JSON.parse(wecom.body)).toEqual({ msgtype: 'markdown', markdown: { content: '**群聊摘要**\n\n**要点**：周三上线' } });
+  const long = JSON.parse(buildWebhookRequest('wecom', url('https://qyapi.weixin.qq.com/x'), { ...message, markdown: '长'.repeat(5000) }, undefined, now).body);
+  expect(Buffer.byteLength(long.markdown.content, 'utf8')).toBeLessThanOrEqual(4096);
+
+  const telegram = buildWebhookRequest('telegram', url('https://api.telegram.org/botT/sendMessage?chat_id=42'), message, undefined, now);
+  expect(JSON.parse(telegram.body)).toEqual({ text: '群聊摘要\n\n**要点**：周三上线', disable_web_page_preview: true });
+
+  const notion = buildWebhookRequest('notion', url('https://api.notion.com/v1/blocks/abc/children'), message, 'secret_notion', now);
+  expect(notion.method).toBe('PATCH');
+  expect(notion.headers).toMatchObject({ Authorization: 'Bearer secret_notion', 'Notion-Version': '2022-06-28' });
+  const children = JSON.parse(notion.body).children;
+  expect(children[0]).toMatchObject({ type: 'heading_2', heading_2: { rich_text: [{ type: 'text', text: { content: '群聊摘要' } }] } });
+  expect(children[1]).toMatchObject({ type: 'paragraph', paragraph: { rich_text: [{ text: { content: '**要点**：周三上线' } }] } });
+  expect(() => buildWebhookRequest('notion', url('https://api.notion.com/v1/blocks/abc/children'), message, undefined, now)).toThrow('missing-key');
+
+  const generic = buildWebhookRequest('generic', url('https://hooks.example.org/x'), message, 'g-secret', now);
+  const signature = `sha256=${createHmac('sha256', 'g-secret').update(generic.body).digest('hex')}`;
+  expect(JSON.parse(generic.body)).toEqual(message);
+  expect(generic.headers).toMatchObject({ 'X-Webhook-Signature': signature, 'X-WeChatBridge-Signature': signature });
+});
+
+test('v2.2 #8 插件出口按平台投递，保留 Telegram 查询参数并识别业务错误码', async () => {
+  const hooks = hookServer(path => path === '/feishu-bad'
+    ? Response.json({ code: 19021, msg: 'sign match fail or timestamp is not within one hour from current time' })
+    : path === '/wecom-bad' ? Response.json({ errcode: 93000, errmsg: 'invalid webhook url' }) : Response.json({ code: 0, errcode: 0, ok: true }));
+  const secrets: Record<string, string> = { feishu: 'fs-secret', notion: 'secret_notion', generic: 'g-secret' };
+  const t = setup({ resolveWebhookSecret: (_plugin, sink) => secrets[sink] });
+  try {
+    const sinks = new SinkDispatcher(t.dependencies);
+    const signal = new AbortController().signal;
+    const result = await sinks.dispatch([
+      { id: 'feishu', type: 'webhook', url: `${hooks.base}/feishu`, hasSecret: true, platform: 'feishu' },
+      { id: 'wecom', type: 'webhook', url: `${hooks.base}/wecom?key=abc`, hasSecret: false, platform: 'wecom' },
+      { id: 'telegram', type: 'webhook', url: `${hooks.base}/botT/sendMessage?chat_id=42`, hasSecret: false, platform: 'telegram' },
+      { id: 'notion', type: 'webhook', url: `${hooks.base}/v1/blocks/abc/children`, hasSecret: true, platform: 'notion' },
+      { id: 'generic', type: 'webhook', url: `${hooks.base}/generic`, hasSecret: true },
+    ], webhookOutput(signal));
+    expect(result.errors).toEqual([]);
+    const by = (path: string) => hooks.captured.find(row => row.path === path)!;
+    const feishu = JSON.parse(by('/feishu').body);
+    expect(feishu.msg_type).toBe('interactive');
+    expect(feishu.sign).toBe(feishuSign(feishu.timestamp, 'fs-secret'));
+    expect(feishu.timestamp).toBe(String(Math.floor(epoch / 1000)));
+    expect(by('/wecom').search).toBe('?key=abc');
+    expect(JSON.parse(by('/wecom').body).msgtype).toBe('markdown');
+    expect(by('/botT/sendMessage').search).toBe('?chat_id=42');
+    expect(JSON.parse(by('/botT/sendMessage').body).disable_web_page_preview).toBe(true);
+    expect(by('/v1/blocks/abc/children')).toMatchObject({ method: 'PATCH',
+      headers: { authorization: 'Bearer secret_notion', 'notion-version': '2022-06-28' } });
+    const generic = by('/generic');
+    const signature = `sha256=${createHmac('sha256', 'g-secret').update(generic.body).digest('hex')}`;
+    expect(generic.headers['x-webhook-signature']).toBe(signature);
+    expect(generic.headers['x-wechatbridge-signature']).toBe(signature);
+    expect(hooks.captured.every(row => !row.headers.cookie)).toBe(true);
+    expect(t.wire).toEqual([]);
+
+    const failed = await sinks.dispatch([
+      { id: 'feishu', type: 'webhook', url: `${hooks.base}/feishu-bad`, hasSecret: true, platform: 'feishu' },
+      { id: 'wecom', type: 'webhook', url: `${hooks.base}/wecom-bad`, hasSecret: false, platform: 'wecom' },
+      { id: 'notion', type: 'webhook', url: `${hooks.base}/v1/pages`, hasSecret: false, platform: 'notion' },
+    ], webhookOutput(signal));
+    expect(failed.errors.sort()).toEqual(['invalid-endpoint', 'invalid-endpoint', 'missing-key']);
+    // 所有平台同样拦截 SSRF 与非 HTTPS。
+    for (const platform of ['feishu', 'wecom', 'telegram', 'notion'] as const) {
+      const blocked = await sinks.dispatch([{ id: 'x', type: 'webhook', url: 'https://169.254.169.254/latest', hasSecret: false, platform },
+        { id: 'y', type: 'webhook', url: 'http://example.org/hook', hasSecret: false, platform }], webhookOutput(signal));
+      expect(blocked.errors).toEqual(['invalid-endpoint', 'invalid-endpoint']);
+    }
+  } finally { hooks.stop(); await t.close(); }
+});
+
+test('v2.2 #8 plugins.testWebhook 发送无害测试消息，SSRF 与跳转被拒绝且绝不触发微信发信', async () => {
+  const hooks = hookServer(path => path === '/redirect' ? Response.redirect('http://127.0.0.1:1/', 307)
+    : path === '/reject' ? new Response('forbidden', { status: 403 }) : new Response(null, { status: 204 }));
+  const t = setup({ resolveWebhookSecret: () => 'stored-secret' });
+  try {
+    const handler = t.manager.extensions['plugins.testWebhook']!;
+    const params = rpcSchemas['plugins.testWebhook'].params;
+    expect(params.safeParse({ pluginId: 'digest', sinkId: 'hook', url: 'ftp://example.org' }).success).toBe(false);
+    expect(params.safeParse({ pluginId: 'digest', sinkId: 'hook', url: 'https://example.org', platform: 'slack' }).success).toBe(false);
+    expect(params.safeParse({ pluginId: 'digest', sinkId: 'hook', url: 'https://example.org', secret: 'bad\nsecret' }).success).toBe(false);
+
+    const ok = rpcSchemas['plugins.testWebhook'].result.parse(
+      await handler({ pluginId: 'digest', sinkId: 'hook', url: `${hooks.base}/generic`, secret: 'given-secret' }));
+    expect(ok).toEqual({ ok: true, statusCode: 204, detail: '测试通知已送达（HTTP 204）' });
+    const sent = hooks.captured.at(-1)!;
+    expect(JSON.parse(sent.body)).toMatchObject({ pluginId: 'digest', title: '微信桥通知测试', markdown: '这是一条连通性测试消息。' });
+    expect(sent.headers['x-wechatbridge-signature']).toBe(`sha256=${createHmac('sha256', 'given-secret').update(sent.body).digest('hex')}`);
+
+    // 未显式传入密钥时回退到已保存的出口密钥。
+    await handler({ pluginId: 'digest', sinkId: 'hook', url: `${hooks.base}/feishu`, platform: 'feishu' });
+    const feishu = JSON.parse(hooks.captured.at(-1)!.body);
+    expect(feishu.card.header.title.content).toBe('微信桥通知测试');
+    expect(feishu.sign).toBe(feishuSign(feishu.timestamp, 'stored-secret'));
+
+    const rejected = await handler({ pluginId: 'digest', sinkId: 'hook', url: `${hooks.base}/reject`, platform: 'telegram' });
+    expect(rejected).toMatchObject({ ok: false, statusCode: 403 });
+    expect(rejected.detail).toContain('HTTP 403');
+
+    const count = hooks.captured.length;
+    for (const url of ['https://10.0.0.2/hook', 'https://169.254.169.254/', 'https://localhost./x', 'http://example.org/hook', `${hooks.base}/redirect`]) {
+      const blocked = rpcSchemas['plugins.testWebhook'].result.parse(await handler({ pluginId: 'digest', sinkId: 'hook', url, platform: 'wecom' }));
+      expect(blocked.ok).toBe(false);
+      expect(blocked.statusCode).toBeUndefined();
+      expect(blocked.detail).toContain('invalid-endpoint');
+    }
+    expect(hooks.captured.length).toBe(count + 1); // 仅跳转源本身被访问一次，未跟随跳转。
+    expect(t.wire).toEqual([]);
+  } finally { hooks.stop(); await t.close(); }
+});
+
+test('v2.2 #8 V3EngineApp 从 0600 secrets.json 回退读取已保存的 Webhook 密钥', async () => {
+  const { chmodSync, writeFileSync } = await import('node:fs');
+  const { createHmac } = await import('node:crypto');
+  const { V3EngineApp } = await import('../src/ipc/v3-app.ts');
+  const { rpcReplySchema, rpcSchemas } = await import('../src/contracts/ipc.ts');
+  const hooks = hookServer();
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'wmb-v3-wh-')));
+  const frames: unknown[] = [];
+  const app = new V3EngineApp(dir, line => frames.push(JSON.parse(line)));
+  try {
+    const key = 'local.wechatmenubridge.webhook\u001fplugin:p-saved:sink:s-saved';
+    const secretsPath = join(dir, 'secrets.json');
+    writeFileSync(secretsPath, JSON.stringify({ [key]: 'saved-hmac-secret' }) + '\n', { mode: 0o600 });
+    chmodSync(secretsPath, 0o600);
+
+    await app.route(JSON.stringify({
+      v: 3, id: 1, method: 'plugins.testWebhook',
+      params: { pluginId: 'p-saved', sinkId: 's-saved', url: `${hooks.base}/saved` },
+    }));
+    const reply = rpcReplySchema('plugins.testWebhook').parse(frames.at(-1));
+    expect(reply.ok).toBe(true);
+    if (reply.ok) {
+      const result = rpcSchemas['plugins.testWebhook'].result.parse(reply.result);
+      expect(result.ok).toBe(true);
+      expect(result.statusCode).toBe(200);
+    }
+    expect(hooks.captured).toHaveLength(1);
+    const expectedSig = `sha256=${createHmac('sha256', 'saved-hmac-secret').update(hooks.captured[0]!.body).digest('hex')}`;
+    expect(hooks.captured[0]!.headers['x-webhook-signature']).toBe(expectedSig);
+    expect(hooks.captured[0]!.headers['x-wechatbridge-signature']).toBe(expectedSig);
+  } finally {
+    await app.close();
+    hooks.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

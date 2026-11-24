@@ -1268,4 +1268,291 @@ final class V2ViewTests: XCTestCase {
         XCTAssertNotNil(workspace.selectedMemoryConversationId)
         memWin.close()
     }
+
+    // MARK: v2.2.0 精选模板（#6）
+
+    func testFeaturedTemplatesAreValidAndRoundTrip() {
+        for template in PluginTemplates.Featured.allCases {
+            let config = PluginTemplates.featured(template, id: "p-\(template.rawValue)")
+            XCTAssertFalse(config.enabled, "模板默认不启用")
+            XCTAssertEqual(config.builtinTemplate, template.builtinTemplate)
+            XCTAssertEqual(config.scope.includeTypes, template.scopeTypes, "没有预选会话时退回类型通配")
+            XCTAssertTrue(PluginForm(config).issues(presets: []).isEmpty, template.rawValue)
+            XCTAssertEqual(PluginForm(config).build(), config, template.rawValue)
+            XCTAssertNoThrow(try IPCv3.decodeStrict(DeclarativePluginConfig.self, from: IPCv3.encoder().encode(config)))
+        }
+        let digest = PluginTemplates.featured(.dailyDigest, id: "d")
+        XCTAssertEqual(digest.builtinTemplate, .groupDigest)
+        XCTAssertEqual(digest.trigger, .windowTime(cron: nil, everyMinutes: nil, timesOfDay: ["21:00"], minMessages: 5))
+        XCTAssertEqual(digest.processor.outputFormat, .structuredDigestJSON)
+        XCTAssertEqual(digest.sinks, [.appFeed(id: "sink-feed", notifyDesktop: false)], "投递到动态流")
+
+        let alert = PluginTemplates.featured(.keywordAlert, id: "k")
+        XCTAssertEqual(alert.trigger, .realtime(keywords: PluginTemplates.defaultAlertKeywords, regex: nil, mentionSelfOnly: nil))
+        XCTAssertEqual(alert.sinks, [.appFeed(id: "sink-feed", notifyDesktop: true)], "实时提醒带桌面通知")
+        XCTAssertEqual(alert.scope.excludeSelf, true, "自己发的关键词不提醒自己")
+
+        let briefing = PluginTemplates.featured(.dailyBriefing, id: "b")
+        XCTAssertEqual(briefing.builtinTemplate, .dailyBriefing)
+        XCTAssertEqual(briefing.trigger, .windowTime(cron: nil, everyMinutes: nil, timesOfDay: ["09:00"], minMessages: 1))
+        XCTAssertEqual(briefing.processor.outputFormat, .markdown)
+        XCTAssertTrue(briefing.processor.userPromptTemplate.contains("{{messages_markdown}}"))
+        XCTAssertFalse(briefing.sinks.contains { if case .wechat = $0 { return true } else { return false } }, "模板不会默认向微信发信")
+        XCTAssertEqual(Set(PluginTemplates.Featured.allCases.map(\.accessibilityId)).count, 3)
+        XCTAssertEqual(PluginTemplates.Featured.dailyDigest.accessibilityId, "plugin-create-digest", "原生 UI 测试依赖的入口标识不变")
+    }
+
+    func testFeaturedTemplatesPreselectEnabledConversations() throws {
+        let (workspace, _) = try makeWorkspace()
+        seededSettings(workspace)
+        var settings = workspace.settings.draft
+        settings.conversations["wxid_off"] = ConversationPolicy(conversationId: "wxid_off", label: "停用", type: .direct, enabled: false)
+        XCTAssertEqual(PluginTemplates.activeConversationIds(settings, for: .dailyDigest), ["g@chatroom"])
+        XCTAssertEqual(PluginTemplates.activeConversationIds(settings, for: .keywordAlert), ["g@chatroom", "wxid_a"],
+                       "服务号与未启用会话不预选")
+        XCTAssertEqual(PluginTemplates.activeConversationIds(settings, for: .dailyBriefing), ["g@chatroom", "wxid_a"])
+
+        let ids = PluginTemplates.activeConversationIds(settings, for: .keywordAlert)
+        let config = PluginTemplates.featured(.keywordAlert, id: "k", conversationIds: ids, modelPresetId: "local")
+        XCTAssertEqual(config.scope.conversationIds, ["g@chatroom", "wxid_a"])
+        XCTAssertNil(config.scope.includeTypes, "已预选会话时不再类型通配")
+        XCTAssertTrue(PluginForm(config).issues(presets: settings.models).isEmpty)
+    }
+
+    func testPluginListShowsFeaturedEntriesInLightAndDark() async throws {
+        let (workspace, transport) = try makeWorkspace(connected: true)
+        transport.results["plugins.list"] = "[]"
+        try await workspace.plugins.refresh()
+        let size = CGSize(width: ConsoleView.minimumSize.width - 200, height: ConsoleView.minimumSize.height)
+        let light = try snapshot(PluginsView(workspace: workspace), appearance: .aqua, size: size)
+        let dark = try snapshot(PluginsView(workspace: workspace), appearance: .darkAqua, size: size)
+        XCTAssertNotEqual(light, dark)
+    }
+
+    // MARK: v2.2.0 通知出口向导（#8）
+
+    private func webhookForm(_ platform: PluginSinkConfig.WebhookPlatform, url: String, secret: String = "") -> PluginForm {
+        var form = PluginForm(PluginTemplates.featured(.dailyDigest, id: "p"))
+        form.webhookOn = true
+        form.webhookPlatform = platform
+        form.webhookURL = url
+        form.webhookSecret = secret
+        return form
+    }
+
+    func testWebhookPlatformWizardValidatesPerPlatform() {
+        let valid: [(PluginSinkConfig.WebhookPlatform, String, String)] = [
+            (.generic, "https://hooks.example.com/x", ""),
+            (.feishu, "https://open.feishu.cn/open-apis/bot/v2/hook/abc", ""),
+            (.feishu, "https://open.larksuite.com/open-apis/bot/v2/hook/abc", "sign"),
+            (.wecom, "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc", ""),
+            (.telegram, "https://api.telegram.org/bot123456:ABC/sendMessage?chat_id=42", ""),
+            (.notion, "https://api.notion.com/v1/blocks/abc123/children", "secret_x"),
+        ]
+        for (platform, url, secret) in valid {
+            let form = webhookForm(platform, url: url, secret: secret)
+            XCTAssertTrue(form.issues(presets: []).isEmpty, "\(platform.rawValue): \(form.issues(presets: []))")
+            XCTAssertNotNil(form.webhookTestParams, platform.rawValue)
+            guard case .webhook(_, _, let hasSecret, let encoded)? = form.build().sinks.last else { return XCTFail("缺少 webhook 出口") }
+            XCTAssertEqual(encoded, platform == .generic ? nil : platform, "通用平台编码时省略 platform")
+            XCTAssertEqual(hasSecret, !secret.isEmpty)
+        }
+        let invalid: [(PluginSinkConfig.WebhookPlatform, String, String)] = [
+            (.feishu, "https://hooks.example.com/x", ""),
+            (.wecom, "https://open.feishu.cn/x", ""),
+            (.telegram, "https://api.telegram.org/sendMessage?chat_id=42", ""),
+            (.telegram, "https://hooks.example.com/bot1:A/sendMessage", ""),
+            (.notion, "https://api.notion.com/v1/blocks/abc123/children", ""),
+            (.notion, "https://api.notion.com/v1/pages", "secret_x"),
+            (.generic, "http://hooks.example.com/x", ""),
+        ]
+        for (platform, url, secret) in invalid {
+            let form = webhookForm(platform, url: url, secret: secret)
+            XCTAssertFalse(form.issues(presets: []).isEmpty, "\(platform.rawValue) \(url)")
+            XCTAssertNil(form.webhookTestParams, "无效配置不能发送测试通知")
+        }
+        XCTAssertTrue(PluginSinkConfig.WebhookPlatform.allCases.allSatisfy { !$0.guidance.isEmpty && !$0.urlPrompt.isEmpty })
+
+        // 平台往返：从已保存配置读回表单后不丢失所选平台。
+        let saved = webhookForm(.wecom, url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc").build()
+        XCTAssertEqual(PluginForm(saved).webhookPlatform, .wecom)
+        XCTAssertEqual(PluginForm(saved).build(), saved)
+    }
+
+    func testWebhookTestParamsCarryOnlyTypedSecret() {
+        var form = webhookForm(.feishu, url: "https://open.feishu.cn/open-apis/bot/v2/hook/abc", secret: "new sign")
+        var params = form.webhookTestParams
+        XCTAssertEqual(params?.secret, "new sign", "新填写的密钥只随本次 IPC 帧发送")
+        XCTAssertEqual(params?.platform, .feishu)
+        XCTAssertEqual(params?.sinkId, form.webhookId)
+        form.webhookSecret = ""
+        form.hadSecret = true
+        params = form.webhookTestParams
+        XCTAssertNil(params?.secret, "留空时由引擎读取已存密钥")
+        XCTAssertNotNil(params)
+        form.webhookPlatform = .notion
+        form.webhookURL = "https://api.notion.com/v1/blocks/abc123/children"
+        form.removeSecret = true
+        XCTAssertNil(form.webhookTestParams, "Notion 移除密钥后无法测试")
+
+        XCTAssertEqual(WebhookTestResult(ok: true, statusCode: 200, detail: "").message, "测试通知已送达 · HTTP 200")
+        XCTAssertEqual(WebhookTestResult(ok: false, detail: "连接超时").message, "测试通知发送失败 · 连接超时")
+    }
+
+    func testWebhookTestRoundTripsThroughClient() async throws {
+        let (workspace, transport) = try makeWorkspace(connected: true)
+        transport.results["plugins.testWebhook"] = #"{"detail":"签名校验失败","ok":false,"statusCode":403}"#
+        let params = try XCTUnwrap(webhookForm(.feishu, url: "https://open.feishu.cn/open-apis/bot/v2/hook/abc", secret: "s").webhookTestParams)
+        let result = try await workspace.runtime.client.pluginsTestWebhook(params)
+        XCTAssertEqual(result, WebhookTestResult(ok: false, statusCode: 403, detail: "签名校验失败"))
+        XCTAssertEqual(transport.params["plugins.testWebhook"]?["platform"] as? String, "feishu")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("secrets.json").path), "测试通知不写入凭据库")
+    }
+
+    func testWebhookWizardRendersPerPlatformInLightAndDark() throws {
+        let size = CGSize(width: 640, height: 420)
+        var shots: [PluginSinkConfig.WebhookPlatform: Data] = [:]
+        for platform in PluginSinkConfig.WebhookPlatform.allCases {
+            let view = Form {
+                Section("反馈出口") {
+                    WebhookSinkFields(form: .constant(webhookForm(platform, url: "")), ready: true) { _ in
+                        WebhookTestResult(ok: true, statusCode: 200, detail: "")
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            let light = try snapshot(view, appearance: .aqua, size: size)
+            XCTAssertNotEqual(light, try snapshot(view, appearance: .darkAqua, size: size), platform.rawValue)
+            shots[platform] = light
+        }
+        XCTAssertEqual(Set(shots.values).count, shots.count, "不同平台展示不同的地址占位与鉴权说明")
+    }
+
+    // MARK: v2.2.0 记忆云端可见性（#6）
+
+    func testMemoryVisibilitySummaryAndBulkTargets() {
+        let rows = MemoryDocumentParser.parse(personaMarkdown)
+        let summary = MemoryVisibilitySummary(rows: rows)
+        XCTAssertEqual(summary, { var s = MemoryVisibilitySummary(rows: []); s.cloudSafe = 1; s.localOnly = 2; s.locked = 2; return s }())
+        XCTAssertEqual(summary.text, "云端可用 1 条 · 仅本机 2 条 · 已锁定 2 条")
+        XCTAssertEqual(MemoryVisibilitySummary.bulkTargets(rows, to: .cloudSafe), ["p_02"], "锁定条目与手写行不参与批量切换")
+        XCTAssertEqual(MemoryVisibilitySummary.bulkTargets(rows, to: .localOnly), [], "已锁定的云端条目保持原状")
+
+        let privateOnly = MemoryVisibilitySummary(rows: rows.filter { $0.visibility == .localOnly })
+        XCTAssertEqual(privateOnly.cloudNotice(usesCloud: true), "当前没有设为云端可用的条目，云模型回复不会读取此档案。")
+        XCTAssertNil(privateOnly.cloudNotice(usesCloud: false), "本机模型不需要提示")
+        XCTAssertNil(summary.cloudNotice(usesCloud: true))
+        XCTAssertNil(MemoryVisibilitySummary(rows: []).cloudNotice(usesCloud: true), "空档案不提示")
+    }
+
+    func testMemoryCloudModelDetection() throws {
+        let (workspace, _) = try makeWorkspace()
+        seededSettings(workspace)
+        var settings = workspace.settings.draft
+        XCTAssertFalse(MemoryVisibilitySummary.usesCloudModel(settings, target: .persona))
+        XCTAssertFalse(MemoryVisibilitySummary.usesCloudModel(settings, target: .scope(conversationId: "wxid_a")))
+        settings.conversations["wxid_a"]?.replyPresetId = "cloud"
+        XCTAssertTrue(MemoryVisibilitySummary.usesCloudModel(settings, target: .scope(conversationId: "wxid_a")), "会话覆盖为云端模型")
+        XCTAssertFalse(MemoryVisibilitySummary.usesCloudModel(settings, target: .scope(conversationId: "g@chatroom")))
+        XCTAssertTrue(MemoryVisibilitySummary.usesCloudModel(settings, target: .persona), "人格档案被任一云端会话读取")
+        settings.conversations["wxid_a"]?.replyPresetId = nil
+        settings.defaultModels.replyPresetId = "cloud"
+        XCTAssertTrue(MemoryVisibilitySummary.usesCloudModel(settings, target: .scope(conversationId: "g@chatroom")), "跟随云端主模型")
+    }
+
+    func testBulkVisibilityCallsEngineOncePerEntry() async throws {
+        let (workspace, transport) = try makeWorkspace(connected: true)
+        transport.results["memory.setEntryVisibility"] = #"{"createdAt":1764000000000,"diffPreview":"","revId":"rev-2","scopeKey":"global","snapshotPath":"/x/rev-2.md","source":"manual","summary":"可见性","targetKind":"persona"}"#
+        let changed = try await workspace.memory.setEntriesVisibility(.persona, entryIds: ["p_02", "p_03"], visibility: .cloudSafe)
+        XCTAssertEqual(changed, 2)
+        XCTAssertEqual(transport.methods.filter { $0 == "memory.setEntryVisibility" }.count, 2, "逐条调用，保留每一步的快照与撤销")
+        XCTAssertEqual(transport.params["memory.setEntryVisibility"]?["visibility"] as? String, "cloud-safe")
+        XCTAssertEqual(transport.params["memory.setEntryVisibility"]?["entryId"] as? String, "p_03")
+    }
+
+    func testMemoryVisibilityBarRendersInLightAndDark() async throws {
+        let (workspace, _) = try makeWorkspace(connected: true)
+        try await workspace.memory.load(.persona)
+        workspace.memorySection = .persona
+        let size = CGSize(width: 780, height: 640)
+        let light = try snapshot(MemoryView(workspace: workspace), appearance: .aqua, size: size)
+        let dark = try snapshot(MemoryView(workspace: workspace), appearance: .darkAqua, size: size)
+        XCTAssertNotEqual(light, dark)
+        XCTAssertNotNil(workspace.memory.documents[.persona]?.text)
+    }
+
+    // MARK: v2.2.0 引用回复与 @ 成员（#7）
+
+    func testReplyStyleHintFollowsCapabilities() throws {
+        let none = ReplyStyleHint(capabilities: nil)
+        XCTAssertEqual(none.nativeReply, "当前 X1a0HeWeChatPlugin 未开启引用回复能力，将按普通文本回复")
+        XCTAssertNotNil(none.mentionSend)
+        let caps = try JSONDecoder().decode(XiaoheCapabilities.self, from: Data(capabilitiesJSON.utf8))
+        XCTAssertEqual(ReplyStyleHint(capabilities: caps), ReplyStyleHint(capabilities: caps))
+        XCTAssertNil(ReplyStyleHint(capabilities: caps).nativeReply)
+        XCTAssertNil(ReplyStyleHint(capabilities: caps).mentionSend)
+        var partial = caps
+        partial.mentionSend = false
+        XCTAssertNil(ReplyStyleHint(capabilities: partial).nativeReply)
+        XCTAssertNotNil(ReplyStyleHint(capabilities: partial).mentionSend)
+    }
+
+    func testReplyStyleTogglesWriteDraftAndRenderInLightAndDark() throws {
+        let (workspace, _) = try makeWorkspace(connected: true)
+        seededSettings(workspace)
+        workspace.selectedConversationId = "g@chatroom"
+        let size = CGSize(width: ConsoleView.minimumSize.width - 200, height: 1600)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            workspace.settings.draft.conversations["g@chatroom"]?.useNativeReply = false
+            workspace.settings.draft.conversations["g@chatroom"]?.mentionReplySender = false
+            let off = try snapshot(ConversationsView(workspace: workspace), appearance: appearance, size: size)
+            workspace.settings.draft.conversations["g@chatroom"]?.useNativeReply = true
+            workspace.settings.draft.conversations["g@chatroom"]?.mentionReplySender = true
+            let on = try snapshot(ConversationsView(workspace: workspace), appearance: appearance, size: size)
+            XCTAssertNotEqual(off, on, appearance.rawValue)
+        }
+        XCTAssertTrue(workspace.settings.hasUnsavedChanges, "开关走草稿，保存后才生效")
+        let encoded = String(decoding: try IPCv3.encoder().encode(workspace.settings.draft), as: UTF8.self)
+        XCTAssertTrue(encoded.contains(#""mentionReplySender":true"#))
+        XCTAssertTrue(encoded.contains(#""useNativeReply":true"#))
+    }
+
+    // MARK: v2.2.0 远程热更新资产（#5）
+
+    func testHotBundlesManifestValidation() {
+        XCTAssertNil(HotBundlesRow.manifestIssue(""), "留空使用官方默认清单")
+        XCTAssertNil(HotBundlesRow.manifestIssue(HotBundlesRow.officialManifestURL))
+        XCTAssertNil(HotBundlesRow.manifestIssue("  https://mirror.example.com/bundles-manifest.json "))
+        for bad in ["http://example.com/m.json", "ftp://example.com/m.json", "https://", "https://user:pw@example.com/m.json", "not a url"] {
+            XCTAssertNotNil(HotBundlesRow.manifestIssue(bad), bad)
+        }
+    }
+
+    func testHotBundlesRowSyncControlsRenderInLightAndDark() throws {
+        let item = HotBundleItem(name: "policy.json", sha256: String(repeating: "a", count: 64), verified: true)
+        let ok = HotBundlesStatus(loadedCount: 1, version: "2026.11.24", lastReloadAt: 1_764_000_000_000, items: [item])
+        var bad = ok
+        bad.items[0].verified = false
+        func row(_ status: HotBundlesStatus?, url: String = "") -> some View {
+            HotBundlesRow(status: status, busy: false, fault: nil, ready: true, reload: {},
+                          manifestURL: .constant(url), sync: {}, reset: {}).frame(width: 560).padding()
+        }
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let base = try snapshot(row(ok), appearance: appearance, size: CGSize(width: 620, height: 360))
+            XCTAssertNotEqual(base, try snapshot(row(bad), appearance: appearance, size: CGSize(width: 620, height: 360)), "未验证要有标签")
+            XCTAssertNotEqual(base, try snapshot(row(ok, url: "http://insecure.example.com/m.json"), appearance: appearance,
+                                                 size: CGSize(width: 620, height: 360)), "非 HTTPS 清单要提示")
+        }
+    }
+
+    func testUpdateCardSyncAndResetCallEngine() async throws {
+        let (workspace, transport) = try makeWorkspace(connected: true)
+        let status = try await workspace.runtime.client.systemBundles(action: .sync, manifestUrl: HotBundlesRow.officialManifestURL)
+        XCTAssertEqual(status.loadedCount, 1)
+        XCTAssertEqual(transport.params["system.bundles"]?["action"] as? String, "sync")
+        XCTAssertEqual(transport.params["system.bundles"]?["manifestUrl"] as? String, HotBundlesRow.officialManifestURL)
+        _ = try await workspace.runtime.client.systemBundles(action: .reset)
+        XCTAssertEqual(transport.params["system.bundles"]?["action"] as? String, "reset")
+        XCTAssertNil(transport.params["system.bundles"]?["manifestUrl"])
+    }
 }

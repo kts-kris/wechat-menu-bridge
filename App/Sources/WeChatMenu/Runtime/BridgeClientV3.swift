@@ -250,8 +250,8 @@ extension BridgeClientV3 {
         try await call(.systemHealthCheck, RPCParams.HealthCheck(presetId: presetId, conversationId: conversationId))
     }
 
-    func systemBundles(action: String) async throws -> HotBundlesStatus {
-        try await call(.systemBundles, RPCParams.Bundles(action: action))
+    func systemBundles(action: HotBundlesAction, manifestUrl: String? = nil) async throws -> HotBundlesStatus {
+        try await call(.systemBundles, RPCParams.Bundles(action: action, manifestUrl: manifestUrl))
     }
 
     func xiaoheAccounts(mcpUrl: String? = nil) async throws -> [XiaoheAccountOption] {
@@ -325,6 +325,10 @@ extension BridgeClientV3 {
     func pluginsRunNow(_ params: RPCParams.RunNow) async throws -> PluginRunStart { try await call(.pluginsRunNow, params) }
 
     func pluginsRuns(_ params: RPCParams.PluginRuns) async throws -> IPCPage<PluginRun> { try await call(.pluginsRuns, params) }
+
+    func pluginsTestWebhook(_ params: RPCParams.TestWebhook) async throws -> WebhookTestResult {
+        try await call(.pluginsTestWebhook, params)
+    }
 
     func memoryGet(_ target: MemoryTarget) async throws -> MemoryContent { try await call(.memoryGet, RPCParams.Memory(target: target)) }
 

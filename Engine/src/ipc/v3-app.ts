@@ -12,9 +12,12 @@ import { MemoryStore } from '../memory/store.ts';
 import { memoryScopeKey, type MemoryTarget, type ScopeTarget } from '../memory/types.ts';
 import { PluginManager } from '../plugins/manager.ts';
 import { ensurePrivateDir, readPrivateFile, resolveContainedPath } from '../storage/fs-safe.ts';
-import { HotBundleManager } from '../storage/hot-bundles.ts';
+import { HotBundleManager, type HotBundleOptions } from '../storage/hot-bundles.ts';
 import type { MemoryRevision, PersonaProposal } from '../storage/journal-v2.ts';
 import { IpcV3Router, type IpcV3Extensions } from './router-v3.ts';
+
+export const DEFAULT_BUNDLES_MANIFEST_URL =
+  'https://github.com/kts-kris/wechat-menu-bridge/releases/latest/download/bundles-manifest.json';
 
 function toRpcRevision(row: MemoryRevision) {
   return {
@@ -53,7 +56,7 @@ export class V3EngineApp {
   private readonly unsubscribes: (() => void)[] = [];
   private closed = false;
 
-  constructor(private readonly stateDir: string, sink: (line: string) => void) {
+  constructor(private readonly stateDir: string, sink: (line: string) => void, bundleOptions: HotBundleOptions = {}) {
     ensurePrivateDir(stateDir);
     const settings = loadSettingsV2FromDisk(stateDir);
     this.orchestrator = new BridgeOrchestrator(stateDir, {
@@ -66,7 +69,7 @@ export class V3EngineApp {
     this.memoryDir = this.resolveMemoryDir(settings);
     this.memoryStore = new MemoryStore(this.memoryDir, this.orchestrator.journal);
     this.assembler = new PromptContextAssembler(this.memoryStore);
-    this.bundles = new HotBundleManager(stateDir);
+    this.bundles = new HotBundleManager(stateDir, bundleOptions);
     this.orchestrator.modelRouter.setReasoningEffortDisabled(this.bundles.disabledReasoningEffortUrls());
     this.consolidator = this.createConsolidator(settings);
     this.persona = this.createPersona(settings);
@@ -85,6 +88,7 @@ export class V3EngineApp {
       },
       getHistoryContext: (conversationId, signal) => this.orchestrator.historyContext(conversationId, signal),
       scopeName: conversationId => this.orchestrator.currentSettings.conversations[conversationId]?.label,
+      resolveWebhookSecret: (pluginId, sinkId) => this.resolveWebhookSecret(pluginId, sinkId),
       onFeedAdded: (item, notifyDesktop) => {
         void this.orchestrator.bus.publish('feed.added', {
           item: {
@@ -192,14 +196,13 @@ export class V3EngineApp {
     };
 
     const systemExtensions: IpcV3Extensions = {
-      'system.bundles': ({ action }) => {
-        if (action === 'reload') {
-          const status = this.bundles.reload();
-          this.orchestrator.modelRouter.setReasoningEffortDisabled(this.bundles.disabledReasoningEffortUrls());
-          this.orchestrator.invalidatePromptCache();
-          return status;
-        }
-        return this.bundles.status();
+      'system.bundles': async ({ action, manifestUrl }) => {
+        if (action === 'status') return this.bundles.status();
+        const status = action === 'reload' ? this.bundles.reload() : action === 'reset' ? this.bundles.reset() :
+          await this.bundles.syncFromRemote(manifestUrl ?? DEFAULT_BUNDLES_MANIFEST_URL);
+        this.orchestrator.modelRouter.setReasoningEffortDisabled(this.bundles.disabledReasoningEffortUrls());
+        this.orchestrator.invalidatePromptCache();
+        return status;
       },
     };
 
@@ -219,6 +222,21 @@ export class V3EngineApp {
   hello() { this.router.hello(); }
 
   route(line: string | Uint8Array) { return this.router.route(line); }
+
+  private resolveWebhookSecret(pluginId: string, sinkId: string): string | undefined {
+    if (!pluginId || !sinkId || pluginId.includes(':') || sinkId.includes(':')) return undefined;
+    try {
+      const secretsPath = resolveContainedPath(this.stateDir, 'secrets.json');
+      if (!existsSync(secretsPath)) return undefined;
+      const parsed: unknown = JSON.parse(readPrivateFile(secretsPath, 256 * 1024).toString('utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+      const key = `local.wechatmenubridge.webhook\u001fplugin:${pluginId}:sink:${sinkId}`;
+      const value = (parsed as Record<string, unknown>)[key];
+      return typeof value === 'string' && value.length > 0 ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
 
   private resolveMemoryDir(settings: SettingsV2) {
     return settings.memory.baseDir.trim() || join(this.stateDir, 'memory');

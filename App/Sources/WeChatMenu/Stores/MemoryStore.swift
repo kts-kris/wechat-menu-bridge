@@ -67,6 +67,17 @@ final class MemoryStore: ObservableObject, BridgeEventConsumer {
         await record(target, try await runtime.client.memorySetEntryVisibility(target, entryId: entryId, visibility: visibility))
     }
 
+    // 逐条调用 memory.setEntryVisibility：每次都产生独立快照，保留审计与逐步撤销；中途失败时已完成的条目保持生效。
+    @discardableResult
+    func setEntriesVisibility(_ target: MemoryTarget, entryIds: [String], visibility: MemoryVisibility) async throws -> Int {
+        var changed = 0
+        for entryId in entryIds {
+            try await setEntryVisibility(target, entryId: entryId, visibility: visibility)
+            changed += 1
+        }
+        return changed
+    }
+
     @discardableResult
     func consolidateNow(conversationId: String, backfill: BackfillRequest? = nil) async throws -> MemoryRevision? {
         if let backfill, !backfill.isValid || backfill.conversationId != conversationId {

@@ -6,7 +6,8 @@ import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { id, sha } from '../../contracts.ts';
 import { BridgeError, errorCode } from '../contracts/errors.ts';
-import type { PluginSinkConfig } from '../contracts/plugins.ts';
+import type { RpcParams, RpcResult } from '../contracts/ipc.ts';
+import type { PluginSinkConfig, WebhookPlatform } from '../contracts/plugins.ts';
 import type { TransmitService } from '../core/transmit.ts';
 import { atomicWritePrivateFile, ensurePrivateDir, readPrivateFile, resolveContainedPath } from '../storage/fs-safe.ts';
 import type { FeedItem, JournalV2 } from '../storage/journal-v2.ts';
@@ -63,16 +64,150 @@ export function checkWebhookUrl(raw: string) {
   return url;
 }
 
-function pinnedPost(url: URL, headers: Record<string, string>, body: string, signal: AbortSignal, hostname: string) {
-  return new Promise<number>((resolve, reject) => {
-    const req = request(url, { method: 'POST', headers, signal, agent: false,
+type WebhookResponse = { status: number; text: string };
+type WebhookRequest = { method: 'POST' | 'PATCH'; headers: Record<string, string>; body: string };
+export interface WebhookMessage { pluginId: string; conversationId: string; title: string; markdown: string }
+const RESPONSE_PREVIEW_BYTES = 4096;
+
+function pinnedRequest(url: URL, request_: WebhookRequest, signal: AbortSignal, hostname: string) {
+  return new Promise<WebhookResponse>((resolve, reject) => {
+    const req = request(url, { method: request_.method, headers: request_.headers, signal, agent: false,
       ...(isIP(hostname) === 0 && { servername: hostname }) }, response => {
-      response.destroy();
-      resolve(response.statusCode ?? 0);
+      const chunks: Buffer[] = [];
+      let size = 0;
+      const finish = () => {
+        response.destroy();
+        resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') });
+      };
+      response.on('data', (chunk: Buffer) => {
+        if (size < RESPONSE_PREVIEW_BYTES) chunks.push(chunk.subarray(0, RESPONSE_PREVIEW_BYTES - size));
+        size += chunk.length;
+        if (size >= RESPONSE_PREVIEW_BYTES) finish();
+      });
+      response.on('end', finish);
+      response.on('close', finish);
+      response.on('error', finish);
     });
     req.on('error', reject);
-    req.end(body);
+    req.end(request_.body);
   });
+}
+
+async function previewText(response: Response) {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (size < RESPONSE_PREVIEW_BYTES) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    size += value.byteLength;
+  }
+  await reader.cancel().catch(() => {});
+  return Buffer.concat(chunks).subarray(0, RESPONSE_PREVIEW_BYTES).toString('utf8');
+}
+
+function clip(text: string, max: number) {
+  if (text.length <= max) return text;
+  let value = text.slice(0, max - 1);
+  if (/[\uD800-\uDBFF]$/u.test(value)) value = value.slice(0, -1);
+  return `${value}…`;
+}
+
+function clipBytes(text: string, maxBytes: number) {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let value = text;
+  while (Buffer.byteLength(value, 'utf8') > maxBytes - 3) value = value.slice(0, Math.floor(value.length * 0.9));
+  if (/[\uD800-\uDBFF]$/u.test(value)) value = value.slice(0, -1);
+  return `${value}…`;
+}
+
+const hmacHex = (key: string, body: string) => `sha256=${createHmac('sha256', key).update(body).digest('hex')}`;
+
+/** 飞书自定义机器人签名：以 `timestamp\nsecret` 为 HMAC-SHA256 密钥，对空串签名后 Base64。 */
+export function feishuSign(timestamp: string, secret: string) {
+  return createHmac('sha256', `${timestamp}\n${secret}`).update('').digest('base64');
+}
+
+function notionBlocks(title: string, markdown: string) {
+  const text = (content: string) => [{ type: 'text', text: { content } }];
+  const chunks: string[] = [];
+  for (const paragraph of markdown.split(/\n{2,}/u).map(part => part.trim()).filter(Boolean)) {
+    for (let index = 0; index < paragraph.length && chunks.length < 90; index += 1900) {
+      chunks.push(paragraph.slice(index, index + 1900));
+    }
+  }
+  return [
+    { object: 'block', type: 'heading_2', heading_2: { rich_text: text(clip(title, 1900)) } },
+    ...chunks.map(content => ({ object: 'block', type: 'paragraph', paragraph: { rich_text: text(content) } })),
+  ];
+}
+
+/** 按平台构造请求体与签名头；纯函数，便于单测核对。 */
+export function buildWebhookRequest(platform: WebhookPlatform, url: URL, message: WebhookMessage,
+  secret: string | undefined, now: number): WebhookRequest {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const title = clip(message.title.trim() || '微信桥通知', 200);
+  switch (platform) {
+    case 'feishu': {
+      const payload: Record<string, unknown> = {
+        msg_type: 'interactive',
+        card: {
+          config: { wide_screen_mode: true },
+          header: { title: { tag: 'plain_text', content: title } },
+          elements: [{ tag: 'markdown', content: clip(message.markdown, 4000) }],
+        },
+      };
+      if (secret) {
+        const timestamp = String(Math.floor(now / 1000));
+        payload.timestamp = timestamp;
+        payload.sign = feishuSign(timestamp, secret);
+      }
+      return { method: 'POST', headers, body: JSON.stringify(payload) };
+    }
+    case 'wecom':
+      return { method: 'POST', headers, body: JSON.stringify({
+        msgtype: 'markdown', markdown: { content: clipBytes(`**${title}**\n\n${message.markdown}`, 4096) },
+      }) };
+    case 'telegram':
+      // chat_id 等查询参数保留在 URL 上，正文只携带文本。
+      return { method: 'POST', headers, body: JSON.stringify({
+        text: clip(`${title}\n\n${message.markdown}`, 4096), disable_web_page_preview: true,
+      }) };
+    case 'notion': {
+      if (!secret) throw new BridgeError('missing-key');
+      headers.Authorization = `Bearer ${secret}`;
+      headers['Notion-Version'] = '2022-06-28';
+      const append = /\/children\/?$/.test(url.pathname);
+      return { method: append ? 'PATCH' : 'POST', headers, body: JSON.stringify({ children: notionBlocks(title, message.markdown) }) };
+    }
+    case 'generic': {
+      const body = JSON.stringify({ pluginId: message.pluginId, conversationId: message.conversationId,
+        title: message.title, markdown: message.markdown });
+      if (secret) {
+        const signature = hmacHex(secret, body);
+        headers['X-Webhook-Signature'] = signature;
+        headers['X-WeChatBridge-Signature'] = signature;
+      }
+      return { method: 'POST', headers, body };
+    }
+  }
+}
+
+/** 部分平台以 HTTP 200 + 业务错误码返回失败，需解析正文判定。 */
+function platformAccepted(platform: WebhookPlatform, response: WebhookResponse) {
+  if (response.status < 200 || response.status >= 300) return false;
+  let body: Record<string, unknown> | undefined;
+  try {
+    const parsed: unknown = JSON.parse(response.text);
+    body = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : undefined;
+  } catch { return true; }
+  if (!body) return true;
+  if (platform === 'feishu') return (body.code ?? body.StatusCode ?? 0) === 0;
+  if (platform === 'wecom') return (body.errcode ?? 0) === 0;
+  if (platform === 'telegram') return body.ok !== false;
+  return true;
 }
 
 function abortable<T>(work: T | Promise<T>, signal: AbortSignal): Promise<T> {
@@ -114,9 +249,8 @@ export class SinkDispatcher {
           if (output.origin !== 'backfill') await this.wechat(sink.targetConversationId, output.markdown, sink.approved, output);
           return;
         case 'webhook':
-          await this.webhook(sink.url, { pluginId: output.pluginId, conversationId: output.conversationId,
-            title: output.title, markdown: output.markdown }, output.signal,
-          sink.hasSecret ? { pluginId: output.pluginId, sinkId: sink.id } : undefined);
+          await this.notify(sink, { pluginId: output.pluginId, conversationId: output.conversationId,
+            title: output.title, markdown: output.markdown }, output.signal);
       }
     }));
     return {
@@ -196,35 +330,86 @@ export class SinkDispatcher {
 
   async webhook(raw: string, payload: unknown, parent: AbortSignal, signature?: { pluginId: string; sinkId: string }) {
     const url = checkWebhookUrl(raw);
-    const signal = AbortSignal.any([parent, AbortSignal.timeout(5000)]);
     const body = JSON.stringify(payload);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    let status: number;
+    if (signature) {
+      const key = await this.secret(signature.pluginId, signature.sinkId, url, parent);
+      if (!key) throw new BridgeError('missing-key');
+      headers['X-Webhook-Signature'] = hmacHex(key, body);
+      headers['X-WeChatBridge-Signature'] = headers['X-Webhook-Signature'];
+    }
+    const response = await this.deliver(url, { method: 'POST', headers, body }, parent);
+    if (!platformAccepted('generic', response)) throw new BridgeError('invalid-endpoint');
+    return { status: response.status };
+  }
+
+  /** 按出口平台格式投递一条通知；所有平台统一经过 SSRF 校验、拒绝跳转并固定解析后的公网 IP。 */
+  async notify(sink: Pick<Extract<PluginSinkConfig, { type: 'webhook' }>, 'id' | 'url' | 'hasSecret' | 'platform'>,
+    message: WebhookMessage, parent: AbortSignal) {
+    const platform = sink.platform ?? 'generic';
+    const url = checkWebhookUrl(sink.url);
+    if (platform === 'generic') {
+      return this.webhook(url.href, message, parent, sink.hasSecret ? { pluginId: message.pluginId, sinkId: sink.id } : undefined);
+    }
+    const key = sink.hasSecret ? await this.secret(message.pluginId, sink.id, url, parent) : undefined;
+    if (sink.hasSecret && !key) throw new BridgeError('missing-key');
+    const response = await this.deliver(url, buildWebhookRequest(platform, url, message, key, this.now()), parent);
+    if (!platformAccepted(platform, response)) throw new BridgeError('invalid-endpoint');
+    return { status: response.status };
+  }
+
+  /** 发送一条无害的连通性测试通知；只走 HTTP 出口，绝不触发任何微信发信。 */
+  async testWebhook(params: RpcParams<'plugins.testWebhook'>, parent = new AbortController().signal): Promise<RpcResult<'plugins.testWebhook'>> {
+    const platform = params.platform ?? 'generic';
+    const message: WebhookMessage = { pluginId: params.pluginId, conversationId: 'wechat-bridge-test',
+      title: '微信桥通知测试', markdown: '这是一条连通性测试消息。' };
+    let statusCode: number | undefined;
     try {
-      if (signature) {
-        const key = await abortable(this.options.resolveWebhookSecret?.(signature.pluginId, signature.sinkId, url.href), signal);
-        if (!key) throw new BridgeError('missing-key');
-        headers['X-Webhook-Signature'] = `sha256=${createHmac('sha256', key).update(body).digest('hex')}`;
+      const url = checkWebhookUrl(params.url);
+      const key = params.secret ?? await this.secret(params.pluginId, params.sinkId, url, parent);
+      const response = await this.deliver(url, buildWebhookRequest(platform, url, message, key || undefined, this.now()), parent);
+      statusCode = response.status;
+      if (!platformAccepted(platform, response)) {
+        return { ok: false, statusCode, detail: clip(`服务端拒绝了测试通知（HTTP ${statusCode}）：${response.text.replace(/\s+/gu, ' ').trim() || '无响应正文'}`, 300) };
       }
+      return { ok: true, statusCode, detail: `测试通知已送达（HTTP ${statusCode}）` };
+    } catch (error) {
+      const code = errorCode(error);
+      const reason = code === 'invalid-endpoint' ? '地址无效、被安全策略拦截或无法连接' :
+        code === 'missing-key' ? '缺少该平台所需的密钥或令牌' : code === 'stopped' ? '测试已取消或超时' : '测试通知发送失败';
+      return { ok: false, ...(statusCode !== undefined && { statusCode }), detail: `${reason}（${code}）` };
+    }
+  }
+
+  private async secret(pluginId: string, sinkId: string, url: URL, signal: AbortSignal) {
+    try {
+      return await abortable(this.options.resolveWebhookSecret?.(pluginId, sinkId, url.href),
+        AbortSignal.any([signal, AbortSignal.timeout(5000)]));
+    } catch (error) {
+      if (error instanceof BridgeError) throw error;
+      throw new BridgeError(signal.aborted ? 'stopped' : 'invalid-endpoint');
+    }
+  }
+
+  private async deliver(url: URL, outgoing: WebhookRequest, parent: AbortSignal): Promise<WebhookResponse> {
+    const signal = AbortSignal.any([parent, AbortSignal.timeout(5000)]);
+    try {
       if (url.hostname === '127.0.0.1') {
-        const response = await fetch(url, { method: 'POST', headers, body, signal, redirect: 'error', credentials: 'omit', proxy: '' });
-        status = response.status;
-        await response.body?.cancel();
-      } else {
-        const { hostname } = url;
-        const addresses = isIP(hostname) ? [{ address: hostname, family: 4 }] : await abortable(lookup(hostname, { all: true }), signal);
-        const first = addresses[0];
-        if (!first || !addresses.every(({ address }) => publicAddress(address))) throw new BridgeError('invalid-endpoint');
-        // 固定已验证的 IP，TLS 仍使用原域名，避免连接时再次解析导致 DNS 重绑定。
-        const pinned = new URL(url);
-        pinned.hostname = first.family === 6 ? `[${first.address}]` : first.address;
-        status = await pinnedPost(pinned, { ...headers, Host: url.host }, body, signal, hostname);
+        const response = await fetch(url, { method: outgoing.method, headers: outgoing.headers, body: outgoing.body, signal,
+          redirect: 'error', credentials: 'omit', proxy: '' });
+        return { status: response.status, text: await previewText(response) };
       }
+      const { hostname } = url;
+      const addresses = isIP(hostname) ? [{ address: hostname, family: 4 }] : await abortable(lookup(hostname, { all: true }), signal);
+      const first = addresses[0];
+      if (!first || !addresses.every(({ address }) => publicAddress(address))) throw new BridgeError('invalid-endpoint');
+      // 固定已验证的 IP，TLS 仍使用原域名，避免连接时再次解析导致 DNS 重绑定。
+      const pinned = new URL(url);
+      pinned.hostname = first.family === 6 ? `[${first.address}]` : first.address;
+      return await pinnedRequest(pinned, { ...outgoing, headers: { ...outgoing.headers, Host: url.host } }, signal, hostname);
     } catch (error) {
       if (error instanceof BridgeError) throw error;
       throw new BridgeError(parent.aborted ? 'stopped' : 'invalid-endpoint');
     }
-    if (status < 200 || status >= 300) throw new BridgeError('invalid-endpoint');
-    return { status };
   }
 }

@@ -914,3 +914,111 @@ test('波次 B: 自适应防抖、防抖期并行预热上下文与 fastReplyMod
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- v2.2.0 #7：多模态实时闭环 + 原生引用回复 & 精准 @成员 ----
+
+async function withPolicy(t: Awaited<ReturnType<typeof setup>>, id: string, extra: Record<string, unknown>) {
+  const next = structuredClone(t.bridge.currentSettings);
+  next.conversations[id] = { ...next.conversations[id]!, ...extra };
+  await t.bridge.applySettings(next);
+}
+const replies = (t: Awaited<ReturnType<typeof setup>>, id: string) =>
+  t.calls.filter(c => c.name === 'messages.reply' && c.args.conversation_id === id);
+
+test('v2.2 #7 会话策略新字段向后兼容，默认关闭原生引用回复与 @ 发言人', () => {
+  const legacy = conversationPolicySchema.parse({ conversationId: peer, label: peer, type: 'direct', enabled: true, replyMode: 'off' });
+  expect(legacy.useNativeReply).toBe(false);
+  expect(legacy.mentionReplySender).toBe(false);
+});
+
+test('v2.2 #7 useNativeReply 热更新后改用 messages.reply 并携带本轮最新来信 message_ref', async () => {
+  const t = await setup();
+  try {
+    await t.arm(peer);
+    await until(() => t.phase(peer) === 'listening');
+    t.push(incoming('plain-1', peer));
+    await until(() => t.sends(peer).length === 1);
+    await until(() => t.phase(peer) === 'listening');
+    expect(replies(t, peer)).toHaveLength(0);
+    expect(t.sends(peer)[0]!.args.message_ref).toBeUndefined();
+
+    await withPolicy(t, peer, { useNativeReply: true });
+    // 热更新不暂停自动回复。
+    expect(t.bridge.status().sessions[peer]).toMatchObject({ phase: 'listening', replyMode: 'auto' });
+    t.push(incoming('native-1', peer));
+    await until(() => replies(t, peer).length === 1);
+    expect(replies(t, peer)[0]!.args).toMatchObject({ conversation_id: peer, message_ref: 'ref-native-1' });
+    expect(replies(t, peer)[0]!.args.mention_user_ids).toBeUndefined();
+    expect(t.sends(peer)).toHaveLength(1);
+    expect(t.wireFaults).toEqual([]);
+  } finally { await t.close(); }
+});
+
+test('v2.2 #7 群聊 mentionReplySender 传递去重后的本轮发言人 mention_user_ids', async () => {
+  const t = await setup();
+  try {
+    await withPolicy(t, group, { groupTrigger: 'all', mentionReplySender: true });
+    await t.arm(group);
+    await until(() => t.phase(group) === 'listening');
+    t.push(incoming('g-a1', group, { sender_id: 'member_a', text: '大家早' }),
+      incoming('g-b1', group, { sender_id: 'member_b', text: '早上好' }),
+      incoming('g-a2', group, { sender_id: 'member_a', text: '今天天气不错' }));
+    await until(() => t.sends(group).length === 1);
+    const ids = t.sends(group)[0]!.args.mention_user_ids as string[];
+    expect([...ids].sort()).toEqual(['member_a', 'member_b']);
+    expect(replies(t, group)).toHaveLength(0);
+  } finally { await t.close(); }
+});
+
+test('v2.2 #7 群聊同时开启原生引用与 @ 发言人时走 messages.reply 并携带两者', async () => {
+  const t = await setup();
+  try {
+    await withPolicy(t, group, { groupTrigger: 'all', mentionReplySender: true, useNativeReply: true });
+    await t.arm(group);
+    await until(() => t.phase(group) === 'listening');
+    t.push(incoming('g-both', group, { sender_id: 'member_c', text: '这事怎么看？' }));
+    await until(() => replies(t, group).length === 1);
+    expect(replies(t, group)[0]!.args).toMatchObject({ message_ref: 'ref-g-both', mention_user_ids: ['member_c'] });
+  } finally { await t.close(); }
+});
+
+test('v2.2 #7 小禾缺少 messages.reply 与 mention_user_ids 能力时自动降级为普通 messages.send_text', async () => {
+  const t = await setup();
+  t.state.hideReplyTool = true;
+  t.state.hideMentionSend = true;
+  try {
+    await withPolicy(t, group, { groupTrigger: 'all', mentionReplySender: true, useNativeReply: true });
+    await t.arm(group);
+    await until(() => t.phase(group) === 'listening');
+    expect(t.bridge.status().capabilities).toMatchObject({ nativeReply: false, mentionSend: false });
+    t.push(incoming('g-degrade', group, { sender_id: 'member_d', text: '在吗？' }));
+    await until(() => t.sends(group).length === 1);
+    expect(t.calls.some(c => c.name === 'messages.reply')).toBe(false);
+    expect(t.sends(group)[0]!.args.message_ref).toBeUndefined();
+    expect(t.sends(group)[0]!.args.mention_user_ids).toBeUndefined();
+  } finally { await t.close(); }
+});
+
+test('v2.2 #7 图片/语音富化写入耗时与失败原因轨迹，不记录解析正文', async () => {
+  const t = await setup();
+  try {
+    await t.arm(peer);
+    await until(() => t.phase(peer) === 'listening');
+    const traces = () => t.bridge.sessionTraces({ conversationId: peer, limit: 100 }).items;
+    t.push(picture('image-trace-ok'));
+    await until(() => traces().some(entry => /^图片解析完成（耗时 \d+ms）$/.test(entry.summary)));
+    await until(() => t.sends(peer).length === 1);
+
+    t.state.mediaUnavailable = true;
+    t.push(picture('image-trace-fail'));
+    await until(() => traces().some(entry => entry.summary === '图片解析失败（mcp-contract）' && entry.level === 'warn'));
+
+    // 未配置语音转写预设：降级并写出原因码。
+    t.push(incoming('voice-trace', peer, { type: 'voice', text: '', attachments: [{ media_ref: 'voice-trace' }] }));
+    await until(() => traces().some(entry => entry.summary === '语音解析失败（invalid-configuration）'));
+
+    const serialized = JSON.stringify(traces());
+    expect(serialized).not.toContain('一张日落照片');
+    expect(serialized).not.toContain('ZmFrZQ==');
+  } finally { await t.close(); }
+});

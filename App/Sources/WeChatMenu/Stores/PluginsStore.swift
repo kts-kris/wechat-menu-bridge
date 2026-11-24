@@ -58,7 +58,7 @@ final class PluginsStore: ObservableObject, BridgeEventConsumer {
     func deleteDeclarative(pluginId: String) async throws {
         var sinkIds: [String] = []
         if case .declarative(_, let config, _)? = plugins.first(where: { $0.pluginId == pluginId }) {
-            sinkIds = config.sinks.compactMap { if case .webhook(let id, _, _) = $0 { return id } else { return nil } }
+            sinkIds = config.sinks.compactMap { if case .webhook(let id, _, _, _) = $0 { return id } else { return nil } }
         }
         try await runtime.client.pluginsDeleteDeclarative(pluginId: pluginId)
         plugins.removeAll { $0.pluginId == pluginId }

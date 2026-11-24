@@ -243,21 +243,26 @@ struct ConversationPolicy: Codable, Equatable, Identifiable, Sendable {
     var backfillOnArmCount: Int
     var memoryEnabled: Bool
     var pluginIds: [String]
+    // v2.2.0：优先引用原消息回复；群聊回复时 @ 提问成员。旧 settings.json 缺省为 false。
+    var useNativeReply = false
+    var mentionReplySender = false
 
     var id: String { conversationId }
 
     private enum CodingKeys: String, CodingKey {
         case conversationId, label, type, enabled, replyMode, replyPresetId, groupTrigger, riskProfile
-        case backfillOnArmCount, memoryEnabled, pluginIds
+        case backfillOnArmCount, memoryEnabled, pluginIds, useNativeReply, mentionReplySender
     }
 
     init(conversationId: String, label: String, type: ScopeType, enabled: Bool = false, replyMode: SessionReplyMode = .off,
          replyPresetId: String? = nil, groupTrigger: GroupTrigger = .mentionOnly, riskProfile: RiskProfile = RiskProfile(),
-         backfillOnArmCount: Int = 10, memoryEnabled: Bool? = nil, pluginIds: [String] = []) {
+         backfillOnArmCount: Int = 10, memoryEnabled: Bool? = nil, pluginIds: [String] = [],
+         useNativeReply: Bool = false, mentionReplySender: Bool = false) {
         self.conversationId = conversationId; self.label = label; self.type = type; self.enabled = enabled
         self.replyMode = replyMode; self.replyPresetId = replyPresetId; self.groupTrigger = groupTrigger
         self.riskProfile = riskProfile; self.backfillOnArmCount = backfillOnArmCount
         self.memoryEnabled = memoryEnabled ?? (type == .direct); self.pluginIds = pluginIds
+        self.useNativeReply = useNativeReply; self.mentionReplySender = mentionReplySender
     }
 
     init(from decoder: Decoder) throws {
@@ -272,7 +277,9 @@ struct ConversationPolicy: Codable, Equatable, Identifiable, Sendable {
                   riskProfile: try c.defaulted(.riskProfile, RiskProfile(level: nil)),
                   backfillOnArmCount: try c.defaulted(.backfillOnArmCount, 10),
                   memoryEnabled: try c.defaulted(.memoryEnabled, type == .direct),
-                  pluginIds: try c.defaulted(.pluginIds, []))
+                  pluginIds: try c.defaulted(.pluginIds, []),
+                  useNativeReply: try c.defaulted(.useNativeReply, false),
+                  mentionReplySender: try c.defaulted(.mentionReplySender, false))
     }
 }
 
@@ -432,19 +439,24 @@ enum PluginPermission: String, Codable, CaseIterable, Sendable {
 
 enum PluginSinkConfig: Codable, Equatable, Sendable {
     enum MarkdownMode: String, Codable, CaseIterable, Sendable { case append, overwrite }
+    enum WebhookPlatform: String, Codable, CaseIterable, Identifiable, Sendable {
+        case generic, feishu, wecom, telegram, notion
+        var id: String { rawValue }
+    }
     case appFeed(id: String, notifyDesktop: Bool)
     case markdownFile(id: String, directory: String?, filenameTemplate: String, mode: MarkdownMode)
     case wechat(id: String, targetConversationId: String, approved: Bool)
-    case webhook(id: String, url: String, hasSecret: Bool)
+    // platform 为 nil 时编码省略，旧配置不产生差异。
+    case webhook(id: String, url: String, hasSecret: Bool, platform: WebhookPlatform? = nil)
 
     var id: String {
         switch self {
-        case .appFeed(let id, _), .markdownFile(let id, _, _, _), .wechat(let id, _, _), .webhook(let id, _, _): return id
+        case .appFeed(let id, _), .markdownFile(let id, _, _, _), .wechat(let id, _, _), .webhook(let id, _, _, _): return id
         }
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, type, notifyDesktop, directory, filenameTemplate, mode, targetConversationId, approved, url, hasSecret
+        case id, type, notifyDesktop, directory, filenameTemplate, mode, targetConversationId, approved, url, hasSecret, platform
     }
 
     init(from decoder: Decoder) throws {
@@ -460,7 +472,8 @@ enum PluginSinkConfig: Codable, Equatable, Sendable {
             self = .wechat(id: id, targetConversationId: try c.decode(String.self, forKey: .targetConversationId),
                            approved: try c.decode(Bool.self, forKey: .approved))
         case "webhook":
-            self = .webhook(id: id, url: try c.decode(String.self, forKey: .url), hasSecret: try c.decode(Bool.self, forKey: .hasSecret))
+            self = .webhook(id: id, url: try c.decode(String.self, forKey: .url), hasSecret: try c.decode(Bool.self, forKey: .hasSecret),
+                            platform: try c.contains(.platform) ? c.decode(WebhookPlatform.self, forKey: .platform) : nil)
         default: throw contractError(decoder, "Unknown sink type")
         }
     }
@@ -477,8 +490,9 @@ enum PluginSinkConfig: Codable, Equatable, Sendable {
         case .wechat(_, let target, let approved):
             try c.encode("wechat", forKey: .type); try c.encode(target, forKey: .targetConversationId)
             try c.encode(approved, forKey: .approved)
-        case .webhook(_, let url, let hasSecret):
+        case .webhook(_, let url, let hasSecret, let platform):
             try c.encode("webhook", forKey: .type); try c.encode(url, forKey: .url); try c.encode(hasSecret, forKey: .hasSecret)
+            try c.encodeIfPresent(platform, forKey: .platform)
         }
     }
 }
@@ -533,7 +547,9 @@ enum PluginTrigger: Codable, Equatable, Sendable {
 }
 
 struct DeclarativePluginConfig: Codable, Equatable, Identifiable, Sendable {
-    enum BuiltinTemplate: String, Codable, CaseIterable, Sendable { case groupDigest = "group-digest", keywordAlert = "keyword-alert", custom }
+    enum BuiltinTemplate: String, Codable, CaseIterable, Sendable {
+        case groupDigest = "group-digest", keywordAlert = "keyword-alert", dailyBriefing = "daily-briefing", custom
+    }
     enum OutputFormat: String, Codable, CaseIterable, Sendable { case markdown, structuredDigestJSON = "structured_digest_json" }
 
     struct Scope: Codable, Equatable, Sendable {
@@ -717,6 +733,16 @@ struct HotBundlesStatus: Codable, Equatable, Sendable {
     var version: String? = nil
     var lastReloadAt: Int64? = nil
     var items: [HotBundleItem]
+}
+
+// system.bundles 的 action；sync 只接受 HTTPS 清单，并由引擎用内置官方 Ed25519 公钥强制验签。
+enum HotBundlesAction: String, Codable, CaseIterable, Sendable { case status, reload, sync, reset }
+
+// plugins.testWebhook 的结果，逐字对齐 Engine ipc.ts。
+struct WebhookTestResult: Codable, Equatable, Sendable {
+    var ok: Bool
+    var statusCode: Int? = nil
+    var detail: String
 }
 
 struct HealthCheckResult: Codable, Equatable, Sendable {
@@ -1076,7 +1102,7 @@ enum RPCMethod: String, Codable, CaseIterable, Sendable {
     case sessionTraces = "session.traces", sessionResumeCooldown = "session.resumeCooldown"
     case pluginsList = "plugins.list", pluginsSaveDeclarative = "plugins.saveDeclarative"
     case pluginsDeleteDeclarative = "plugins.deleteDeclarative", pluginsSetEnabled = "plugins.setEnabled"
-    case pluginsRunNow = "plugins.runNow", pluginsRuns = "plugins.runs"
+    case pluginsRunNow = "plugins.runNow", pluginsRuns = "plugins.runs", pluginsTestWebhook = "plugins.testWebhook"
     case memoryGet = "memory.get", memorySave = "memory.save", memorySetEntryLock = "memory.setEntryLock"
     case memorySetEntryVisibility = "memory.setEntryVisibility", memoryConsolidateNow = "memory.consolidateNow"
     case memoryRevisions = "memory.revisions", memoryRollback = "memory.rollback"
@@ -1143,7 +1169,10 @@ enum RPCParams {
         func encode(to encoder: Encoder) throws { _ = encoder.container(keyedBy: IPCCodingKey.self) }
     }
     struct PauseAll: Encodable { let scope: PauseScope; let reason: IPCErrorCode }
-    struct Bundles: Encodable { let action: String }
+    struct Bundles: Encodable {
+        let action: HotBundlesAction
+        var manifestUrl: String? = nil
+    }
     struct Accounts: Encodable { var mcpUrl: String? = nil }
     struct Conversations: Encodable {
         var accountId: String? = nil
@@ -1200,6 +1229,14 @@ enum RPCParams {
         let pluginId: String
         var conversationId: String? = nil
         var range: TimeRange? = nil
+    }
+    // secret 只在内存和 IPC 帧中出现；留空时引擎读取 pluginId/sinkId 对应的已存密钥。
+    struct TestWebhook: Encodable {
+        let pluginId: String
+        let sinkId: String
+        let url: String
+        var platform: PluginSinkConfig.WebhookPlatform? = nil
+        var secret: String? = nil
     }
     struct PluginRuns: Encodable {
         let pluginId: String
