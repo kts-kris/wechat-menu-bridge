@@ -13,26 +13,13 @@ shift
 SELECTORS=("$@")
 if [ "$#" -eq 0 ]; then
   for name in \
-    testFirstLaunchOpensSettingsFromMenuBar \
-    testControlWindowOpensFirstLaunchSettings \
-    testControlWindowExplainsUnavailableAutomaticReply \
-    testOpeningRunningBundleRestoresControlWindow \
-    testFirstTimeConfigurationAndLocalPreviewSurviveReopen \
-    testCloudRequiresSeparateConsentAndUsesKeychainAfterUpgrade \
-    testDraftAutoSwitchPauseRestartAndPeerOptOut \
-    testOneShotConfirmsRecipientTextAndTimeAndChecksReceipt \
-    testGapAndUnknownSubmissionStayBlockedUntilExplicitReview; do
+    testConsoleOpensAndSwitchesAllFiveSidebarTabs \
+    testOpeningRunningBundleRestoresConsoleWindow \
+    testMenuBarPopoverOpensConsoleAndFeedbackSheet \
+    testSettingsProbeConfigureLocalModelAndPreview \
+    testConversationDraftAutoPauseAndOptOut; do
     SELECTORS+=("-only-testing:BridgeUI/BridgeUITests/$name")
   done
-  version="$(/usr/bin/sw_vers -productVersion)"
-  if [ "${version%%.*}" -ge 27 ]; then
-    SELECTORS+=(
-      -only-testing:BridgeUI/BridgeUITests/testAutomaticReplyStartsFromHostedMenuBarAfterConfirmation
-      -only-testing:BridgeUI/BridgeUITests/testCloudAutomaticReplyRequiresSeparateMenuBarConfirmation
-      -only-testing:BridgeUI/BridgeUITests/testAutomaticReplyOpensReviewWithSettingsStillOpen
-      -only-testing:BridgeUI/BridgeUITests/testUnavailableAutomaticReplyExplainsWhatToFixInMenuBar
-    )
-  fi
 fi
 for option in "$@"; do
   if [[ ! "$option" =~ ^-only-testing:BridgeUI/BridgeUITests/test[A-Za-z0-9]+$ ]]; then
@@ -48,7 +35,7 @@ PROBE_PID=
 XCODE_LOG=
 FIXTURES=()
 FIXTURE_ENV=
-KEYCHAIN=
+KEYCHAINS=()
 stop_fixtures() {
   local pid rows clean=1
   for pid in "${FIXTURES[@]+${FIXTURES[@]}}"; do
@@ -85,9 +72,9 @@ cleanup() {
     printf 'QA exit could not be verified. Preserving lock %s and stage %s; do not start another batch.\n' "$QA_LOCK" "$STAGE" >&2
     exit 1
   fi
-  if [ -n "$KEYCHAIN" ] && [ -f "$KEYCHAIN" ]; then
-    /usr/bin/security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || result=1
-  fi
+  for keychain in "${KEYCHAINS[@]+${KEYCHAINS[@]}}"; do
+    if [ -f "$keychain" ]; then /usr/bin/security delete-keychain "$keychain" >/dev/null 2>&1 || result=1; fi
+  done
   if [ -n "$STAGE" ]; then
     rm -rf -- "$STAGE"
     echo 'Native QA App, helper, runner and all owned fixtures confirmed exited.'
@@ -122,7 +109,7 @@ ID="local.wechatmenubridge.nativeqa.$(uuidgen | tr '[:upper:]' '[:lower:]')"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $ID" "$APP/Contents/Info.plist"
 codesign --force --sign - --timestamp=none "$APP"
 codesign --verify --deep --strict "$APP"
-for name in first config controls controls-unavailable reopen cloud replies compose recovery menu-replies menu-cloud menu-settings menu-unavailable; do
+for name in console reopen first settings conversation; do
   mkdir -m 700 "$STAGE/home-$name"
 done
 
@@ -130,7 +117,7 @@ export TEST_RUNNER_WMB_UI_STAGE="$STAGE"
 start_fixture() {
   local name="$1" home="$2" info
   env -i HOME="$home" PATH="/usr/bin:/bin" TMPDIR="$home" "$(command -v bun)" --no-env-file \
-    "$ROOT/Engine/test/fixture-cli.ts" --until-terminated "--qa-stage=$STAGE" </dev/null >"$STAGE/$name.json" 2>"$STAGE/$name.log" &
+    "$ROOT/Engine/test/fixture-cli.ts" --until-terminated "--qa-stage=$STAGE" --v2 </dev/null >"$STAGE/$name.json" 2>"$STAGE/$name.log" &
   FIXTURES+=("$!")
   for _ in {1..50}; do
     if info="$(jq -ce 'select(.mcp and .model and .control)' "$STAGE/$name.json" 2>/dev/null)" && [ -n "$info" ]; then
@@ -143,49 +130,38 @@ start_fixture() {
   echo "Synthetic fixture $name did not start" >&2
   return 1
 }
+# v2.1 settings (schemaVersion 2): one local preset on the fixture model and the
+# fixture's direct chat, listening but not armed. Reply mode is always off on disk.
 seed_settings() {
-  local home="$1" fixture="$2" mode="${3:-local}" cloud_url="${4:-https://wechat-bridge.invalid/v1/chat/completions}" dir
+  local home="$1" fixture="$2" dir
   dir="$home/Library/Application Support/WeChatMenuBridge"
   mkdir -p "$dir"
-  jq -c --arg mode "$mode" --arg cloud_url "$cloud_url" '{mcp, account:"mock_account", accountLabel:"模拟账号",
-    contact:{id:"wxid_fixture",label:"模拟联系人"}, mode:$mode,
-    modelURL:(if $mode == "cloud" then $cloud_url else .model end),
-    modelName:"fixture", stylePath:"", memoryPath:"", dailyLimit:1}' <<< "$fixture" > "$dir/settings.json"
+  jq -c '{schemaVersion:2,
+    xiaohe:{mcpUrl:.mcp, hasAuthToken:false, accountId:"mock_account", accountLabel:"模拟账号"},
+    models:[{id:"fixture-local", name:"隔离模型", mode:"local", kind:"chat", url:.model, modelName:"fixture", maxTokens:320, temperature:0.35}],
+    defaultModels:{replyPresetId:"fixture-local"},
+    conversations:{wxid_fixture:{conversationId:"wxid_fixture", label:"模拟联系人", type:"direct", enabled:true, replyMode:"off",
+      groupTrigger:"mention_only", riskProfile:{level:"recommended"}, backfillOnArmCount:0, memoryEnabled:false, pluginIds:[]}},
+    memory:{}, runtime:{}}' <<< "$fixture" > "$dir/settings.json"
 }
 prepare_fixture() {
   case "$1" in
-    testFirstTimeConfigurationAndLocalPreviewSurviveReopen)
-      start_fixture CONFIG "$STAGE/home-config" ;;
-    testCloudRequiresSeparateConsentAndUsesKeychainAfterUpgrade)
-      start_fixture CLOUD "$STAGE/home-cloud"
-      seed_settings "$STAGE/home-cloud" "$TEST_RUNNER_WMB_UI_FIXTURE_CLOUD" cloud ;;
-    testDraftAutoSwitchPauseRestartAndPeerOptOut)
-      start_fixture REPLIES "$STAGE/home-replies"
-      seed_settings "$STAGE/home-replies" "$TEST_RUNNER_WMB_UI_FIXTURE_REPLIES" ;;
-    testAutomaticReplyStartsFromHostedMenuBarAfterConfirmation)
-      start_fixture MENUREPLIES "$STAGE/home-menu-replies"
-      seed_settings "$STAGE/home-menu-replies" "$TEST_RUNNER_WMB_UI_FIXTURE_MENUREPLIES" ;;
-    testCloudAutomaticReplyRequiresSeparateMenuBarConfirmation)
-      start_fixture MENUCLOUD "$STAGE/home-menu-cloud"
-      seed_settings "$STAGE/home-menu-cloud" "$TEST_RUNNER_WMB_UI_FIXTURE_MENUCLOUD" cloud https://wechat-bridge.invalid/v1 ;;
-    testAutomaticReplyOpensReviewWithSettingsStillOpen)
-      start_fixture MENUSETTINGS "$STAGE/home-menu-settings"
-      seed_settings "$STAGE/home-menu-settings" "$TEST_RUNNER_WMB_UI_FIXTURE_MENUSETTINGS" cloud https://wechat-bridge.invalid/v1 ;;
-    testOneShotConfirmsRecipientTextAndTimeAndChecksReceipt)
-      start_fixture COMPOSE "$STAGE/home-compose"
-      seed_settings "$STAGE/home-compose" "$TEST_RUNNER_WMB_UI_FIXTURE_COMPOSE" ;;
-    testGapAndUnknownSubmissionStayBlockedUntilExplicitReview)
-      start_fixture RECOVERY "$STAGE/home-recovery"
-      seed_settings "$STAGE/home-recovery" "$TEST_RUNNER_WMB_UI_FIXTURE_RECOVERY" ;;
-    testFirstLaunchOpensSettingsFromMenuBar|testControlWindowOpensFirstLaunchSettings|testControlWindowExplainsUnavailableAutomaticReply|testOpeningRunningBundleRestoresControlWindow|testUnavailableAutomaticReplyExplainsWhatToFixInMenuBar) ;;
+    testSettingsProbeConfigureLocalModelAndPreview)
+      start_fixture SETTINGS "$STAGE/home-settings" ;;
+    testConversationDraftAutoPauseAndOptOut)
+      start_fixture CONVERSATION "$STAGE/home-conversation"
+      seed_settings "$STAGE/home-conversation" "$TEST_RUNNER_WMB_UI_FIXTURE_CONVERSATION" ;;
+    testConsoleOpensAndSwitchesAllFiveSidebarTabs|testOpeningRunningBundleRestoresConsoleWindow|testMenuBarPopoverOpensConsoleAndFeedbackSheet) ;;
     *) printf 'No isolated fixture mapping for %s; not launching.\n' "$1" >&2; return 1 ;;
   esac
 }
 
-# Synthetic keychain only; no list-keychains, default-keychain, or login-keychain changes.
-KEYCHAIN="$STAGE/home-cloud/nativeqa.keychain-db"
-/usr/bin/security create-keychain -p "$(uuidgen)" "$KEYCHAIN"
-test -f "$KEYCHAIN"
+# Synthetic keychains only; no list-keychains, default-keychain, or login-keychain changes.
+for home in "$STAGE"/home-*; do
+  KEYCHAINS+=("$home/nativeqa.keychain-db")
+  /usr/bin/security create-keychain -p "$(uuidgen)" "$home/nativeqa.keychain-db"
+  test -f "$home/nativeqa.keychain-db"
+done
 xcode=(/usr/bin/xcodebuild -project "$ROOT/App/NativeUITests/BridgeUI.xcodeproj" -scheme BridgeUI
   -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO ARCHS=arm64
   -derivedDataPath "$STAGE/derived")
@@ -244,7 +220,7 @@ for selector in "${SELECTORS[@]}"; do
   prepare_fixture "$name"
   if [ "${WMB_UI_FOCUS_HOST:-}" = 1 ]; then
     case "$name" in
-      testFirstLaunchOpensSettingsFromMenuBar|testAutomaticReplyStartsFromHostedMenuBarAfterConfirmation|testCloudAutomaticReplyRequiresSeparateMenuBarConfirmation|testAutomaticReplyOpensReviewWithSettingsStillOpen|testUnavailableAutomaticReplyExplainsWhatToFixInMenuBar)
+      testMenuBarPopoverOpensConsoleAndFeedbackSheet)
         menu_fixture
         ;;
     esac
@@ -252,7 +228,7 @@ for selector in "${SELECTORS[@]}"; do
   /bin/rm -f -- "$STAGE/no-more-launches" "$STAGE/process-snapshot"
   qa_watch_process_checks "$STAGE" desktop &
   SCAN_PID=$!
-  if [ "${WMB_UI_PROBE_HIT:-}" = 1 ] && [ "$name" = testFirstLaunchOpensSettingsFromMenuBar ]; then
+  if [ "${WMB_UI_PROBE_HIT:-}" = 1 ] && [ "$name" = testMenuBarPopoverOpensConsoleAndFeedbackSheet ]; then
     # Read-only host diagnostic; it never clicks or exposes other AX attributes.
     /usr/bin/swiftc "$ROOT/App/NativeUITests/MenuHitProbe.swift" -o "$STAGE/MenuHitProbe"
     "$STAGE/MenuHitProbe" "$STAGE" "$ID" >"$STAGE/menu-hit-probe.log" 2>&1 &
