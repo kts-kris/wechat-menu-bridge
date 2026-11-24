@@ -5,6 +5,7 @@ enum KeychainNamespace: String, CaseIterable, Sendable {
     case model = "local.wechatmenubridge.model"
     case mcp = "local.wechatmenubridge.mcp"
     case webhook = "local.wechatmenubridge.webhook"
+    case github = "local.wechatmenubridge.github"
 }
 
 // 只能经由工厂方法生成规范账户名，避免同一凭据落到不同索引。
@@ -31,6 +32,10 @@ struct KeychainEntry: Equatable, Sendable {
         guard SettingsV2.identifier(pluginId), SettingsV2.identifier(sinkId),
               !pluginId.contains(":"), !sinkId.contains(":") else { throw BridgeFault("invalid-configuration") }
         return Self(namespace: .webhook, account: "plugin:\(pluginId):sink:\(sinkId)")
+    }
+
+    static func github(host: String = "github.com") -> Self {
+        Self(namespace: .github, account: host)
     }
 }
 
@@ -107,6 +112,8 @@ struct KeychainVault: Sendable {
             if let cached = try Self.fileLock.withLock({ try loadFileMap(directory)[fileKey(entry)] }) {
                 return cached
             }
+            // GitHub Token 为新增凭据命名空间，从未写入旧版 macOS 钥匙串，直接返回缺失以避免无谓查询钥匙串。
+            if entry.namespace == .github { throw BridgeFault("missing-key") }
             // 首次从旧钥匙串平滑迁入本地 0600 凭据文件，后续启动与升级均不再弹窗。
             let legacy = try readKeychain(entry)
             _ = try? Self.fileLock.withLock {

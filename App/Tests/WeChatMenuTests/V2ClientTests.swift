@@ -869,6 +869,7 @@ final class V2ClientTests: XCTestCase {
         XCTAssertEqual(KeychainNamespace.model.rawValue, "local.wechatmenubridge.model")
         XCTAssertEqual(KeychainNamespace.mcp.rawValue, "local.wechatmenubridge.mcp")
         XCTAssertEqual(KeychainNamespace.webhook.rawValue, "local.wechatmenubridge.webhook")
+        XCTAssertEqual(KeychainNamespace.github.rawValue, "local.wechatmenubridge.github")
 
         let entries = KeychainNamespace.allCases.map { KeychainEntry(namespace: $0, account: "same-account") }
         for entry in entries { try vault.save("secret-\(entry.namespace)", for: entry) }
@@ -877,6 +878,7 @@ final class V2ClientTests: XCTestCase {
         XCTAssertThrowsError(try vault.read(entries[0]))
         XCTAssertEqual(try vault.read(entries[1]), "secret-mcp")
         XCTAssertEqual(try vault.read(entries[2]), "secret-webhook")
+        XCTAssertEqual(try vault.read(entries[3]), "secret-github")
     }
 
     @available(macOS, deprecated: 12.0, message: "Uses an isolated classic Keychain.")
