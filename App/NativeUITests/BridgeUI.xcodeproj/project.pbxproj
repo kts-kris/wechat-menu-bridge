@@ -1,0 +1,63 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+		9A0000000000000000000001 = {
+			isa = PBXProject;
+			buildConfigurationList = 9A000000000000000000000A;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			knownRegions = (en, Base);
+			mainGroup = 9A0000000000000000000002;
+			productRefGroup = 9A0000000000000000000003;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (9A0000000000000000000004);
+		};
+		9A0000000000000000000002 = {isa = PBXGroup; children = (9A0000000000000000000005, 9A000000000000000000000E, 9A0000000000000000000010, 9A0000000000000000000003); sourceTree = "<group>"; };
+		9A0000000000000000000003 = {isa = PBXGroup; children = (9A0000000000000000000007); name = Products; sourceTree = "<group>"; };
+		9A0000000000000000000004 = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 9A000000000000000000000B;
+			buildPhases = (9A0000000000000000000008, 9A0000000000000000000009);
+			buildRules = ();
+			dependencies = ();
+			name = BridgeUI;
+			productName = BridgeUI;
+			productReference = 9A0000000000000000000007;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		9A0000000000000000000005 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeUITests.swift; sourceTree = "<group>"; };
+		9A0000000000000000000006 = {isa = PBXBuildFile; fileRef = 9A0000000000000000000005; };
+		9A0000000000000000000007 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = BridgeUI.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		9A0000000000000000000008 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (9A0000000000000000000006, 9A000000000000000000000F, 9A0000000000000000000011); runOnlyForDeploymentPostprocessing = 0; };
+		9A0000000000000000000009 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		9A000000000000000000000A = {isa = XCConfigurationList; buildConfigurations = (9A000000000000000000000C); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+		9A000000000000000000000B = {isa = XCConfigurationList; buildConfigurations = (9A000000000000000000000D); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+		9A000000000000000000000C = {
+			isa = XCBuildConfiguration;
+			name = Debug;
+			buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; };
+		};
+		9A000000000000000000000D = {
+			isa = XCBuildConfiguration;
+			name = Debug;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				ENABLE_APP_SANDBOX = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@loader_path/../Frameworks", "@executable_path/../Frameworks");
+				PRODUCT_BUNDLE_IDENTIFIER = local.wechatmenubridge.native-test-runner;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+		};
+		9A000000000000000000000E = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIFixture.swift; sourceTree = "<group>"; };
+		9A000000000000000000000F = {isa = PBXBuildFile; fileRef = 9A000000000000000000000E; };
+		9A0000000000000000000010 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../Tests/WeChatMenuTests/QAProcessCheck.swift"; sourceTree = "<group>"; };
+		9A0000000000000000000011 = {isa = PBXBuildFile; fileRef = 9A0000000000000000000010; };
+	};
+	rootObject = 9A0000000000000000000001;
+}

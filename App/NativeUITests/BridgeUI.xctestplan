@@ -1,0 +1,14 @@
+{
+  "configurations": [
+    {"id": "CFF45F49-3DB7-4A01-9B6C-13D4E8A4F0A5", "name": "Isolated", "options": {}}
+  ],
+  "defaultOptions": {
+    "automaticScreenCapturePolicy": "off",
+    "testTimeoutsEnabled": true,
+    "defaultTestExecutionTimeAllowance": 150
+  },
+  "testTargets": [
+    {"target": {"containerPath": "container:BridgeUI.xcodeproj", "identifier": "9A0000000000000000000004", "name": "BridgeUI"}}
+  ],
+  "version": 1
+}

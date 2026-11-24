@@ -1,0 +1,51 @@
+name: 缺陷报告
+description: 报告 WeChatMenuBridge 的异常行为，帮助维护者复现和定位问题。
+title: "[缺陷] "
+labels: [bug]
+body:
+  - type: input
+    id: summary
+    attributes:
+      label: 问题摘要
+      description: 用一句话说明哪个功能出现了什么实际结果。
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: App 版本与系统环境
+      description: 填写 WeChatMenuBridge 版本、macOS 版本与芯片型号。若问题涉及微信或小禾，请补充对应版本。
+      placeholder: 例如 WeChatMenuBridge 2.0.0、macOS 15.7、Apple M1
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 脱敏诊断摘要
+      description: 粘贴与问题相关的错误代码、日志摘要或诊断结果。请先移除聊天正文、账号标识、密钥、令牌和私有地址。
+      render: text
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 按顺序填写初始设置、操作步骤和最后看到的实际结果。如问题偶发，请注明发生频率。
+      placeholder: |
+        1. 打开……
+        2. 设置……
+        3. 观察到……
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 说明完成上述操作后，预期看到的结果。
+    validations:
+      required: true
+  - type: upload
+    id: screenshots
+    attributes:
+      label: 实测截图
+      description: 上传能显示实际结果的截图。提交前请遮盖聊天内容、联系人、账号和凭据。
+    validations:
+      required: false

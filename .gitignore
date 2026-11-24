@@ -1,0 +1,5 @@
+.DS_Store
+App/.build/
+Engine/node_modules/
+dist/
+.smoke/
