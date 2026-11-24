@@ -12,6 +12,7 @@ struct UpdateSettingsCard: View {
     @State private var bundles: HotBundlesStatus?
     @State private var bundlesBusy = false
     @State private var bundlesFault: String?
+    @State private var manifestURL = ""
 
     init(workspace: V2Workspace) {
         self.workspace = workspace
@@ -60,7 +61,8 @@ struct UpdateSettingsCard: View {
             }
             statusRow
             details
-            HotBundlesRow(status: bundles, busy: bundlesBusy, fault: bundlesFault, ready: runtime.ready, reload: reloadBundles)
+            HotBundlesRow(status: bundles, busy: bundlesBusy, fault: bundlesFault, ready: runtime.ready, reload: reloadBundles,
+                          manifestURL: $manifestURL, sync: syncBundles, reset: resetBundles)
         }
         .task(id: runtime.ready) { await loadBundles() }
     }
@@ -149,19 +151,30 @@ struct UpdateSettingsCard: View {
             bundles = nil
             return
         }
-        await callBundles("status")
+        await callBundles(.status)
     }
 
     private func reloadBundles() {
-        Task { await callBundles("reload") }
+        Task { await callBundles(.reload) }
     }
 
-    private func callBundles(_ action: String) async {
+    // 留空时由引擎使用官方默认清单；无论来源如何，引擎都用内置官方公钥强制验签。
+    private func syncBundles() {
+        let url = manifestURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard HotBundlesRow.manifestIssue(url) == nil else { return }
+        Task { await callBundles(.sync, manifestUrl: url.isEmpty ? nil : url) }
+    }
+
+    private func resetBundles() {
+        Task { await callBundles(.reset) }
+    }
+
+    private func callBundles(_ action: HotBundlesAction, manifestUrl: String? = nil) async {
         guard !bundlesBusy else { return }
         bundlesBusy = true
         bundlesFault = nil
         defer { bundlesBusy = false }
-        do { bundles = try await runtime.client.systemBundles(action: action) }
+        do { bundles = try await runtime.client.systemBundles(action: action, manifestUrl: manifestUrl) }
         catch { bundlesFault = V2Workspace.code(error) }
     }
 }
@@ -172,6 +185,20 @@ struct HotBundlesRow: View {
     let fault: String?
     let ready: Bool
     let reload: () -> Void
+    var manifestURL: Binding<String> = .constant("")
+    var sync: () -> Void = {}
+    var reset: () -> Void = {}
+
+    static let officialManifestURL = "https://github.com/kts-kris/wechat-menu-bridge/releases/latest/download/bundles-manifest.json"
+
+    // 清单地址可留空（使用官方默认）；填写时只接受 HTTPS，与 Engine ipc.ts 的 manifestUrl 校验一致。
+    static func manifestIssue(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+        guard let url = URLComponents(string: trimmed), url.scheme?.lowercased() == "https", let host = url.host, !host.isEmpty,
+              url.user == nil, url.password == nil else { return "远程资产清单必须是 HTTPS 地址。" }
+        return nil
+    }
 
     private var summary: String {
         guard let status else { return ready ? "正在读取…" : "引擎未就绪" }
@@ -182,12 +209,28 @@ struct HotBundlesRow: View {
     }
 
     private var unverified: Int { status?.items.filter { !$0.verified }.count ?? 0 }
+    private var manifestFault: String? { Self.manifestIssue(manifestURL.wrappedValue) }
+
+    @ViewBuilder private var verificationPill: some View {
+        if let status, !status.items.isEmpty {
+            if unverified == 0 {
+                StatusPill(text: "已验签", tone: .active, symbol: "checkmark.seal.fill")
+                    .accessibilityIdentifier("hot-bundles-verified")
+            } else {
+                StatusPill(text: "\(unverified) 项未验证", tone: .warning, symbol: "exclamationmark.triangle.fill")
+                    .accessibilityIdentifier("hot-bundles-unverified")
+            }
+        }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("引擎热更新资产")
+                    HStack(spacing: 6) {
+                        Text("引擎热更新资产")
+                        verificationPill
+                    }
                     Text(summary).font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
@@ -195,6 +238,48 @@ struct HotBundlesRow: View {
                 Button("重新加载热更新资产", action: reload)
                     .disabled(!ready || busy)
                     .accessibilityIdentifier("hot-bundles-reload")
+            }
+            // 官方地址很长；限定理想宽度，避免占位文字把设置表单撑宽。
+            TextField("远程资产清单（可选）", text: manifestURL, prompt: Text(Self.officialManifestURL))
+                .font(.callout.monospaced())
+                .frame(minWidth: 160, idealWidth: 320, maxWidth: .infinity)
+                .disabled(busy)
+                .accessibilityIdentifier("hot-bundles-manifest-url")
+            Text("远程资产一律使用内置官方 Ed25519 公钥强制验签，未通过验签的文件不会加载。")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Spacer()
+                Button("恢复默认", action: reset)
+                    .disabled(!ready || busy)
+                    .help("移除已同步的远程资产，恢复随应用发布的内置资产")
+                    .accessibilityIdentifier("hot-bundles-reset")
+                Button {
+                    sync()
+                } label: {
+                    Label("拉取远程资产", systemImage: "icloud.and.arrow.down")
+                }
+                .disabled(!ready || busy || manifestFault != nil)
+                .accessibilityIdentifier("hot-bundles-sync")
+            }
+            if let manifestFault { InlineNotice(text: manifestFault, tone: .warning) }
+            if let status, !status.items.isEmpty {
+                DisclosureGroup("资产明细（\(status.items.count) 项）") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(status.items) { item in
+                            HStack(spacing: 6) {
+                                Image(systemName: item.verified ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                                    .foregroundStyle(item.verified ? Color.green : Color.orange)
+                                    .accessibilityLabel(item.verified ? "已验证" : "未验证")
+                                Text(item.name).font(.caption.monospaced()).lineLimit(1)
+                                Spacer()
+                                Text(String(item.sha256.prefix(12))).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                                    .help(item.sha256)
+                            }
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+                .font(.caption)
             }
             if unverified > 0 { InlineNotice(text: "\(unverified) 项未通过校验。", tone: .warning) }
             if let fault { InlineNotice(text: v2Explanation(fault), tone: .critical) }

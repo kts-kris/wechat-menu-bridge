@@ -54,6 +54,8 @@ export const conversationPolicySchema = z.strictObject({
   backfillOnArmCount: z.number().int().min(0).max(500).default(10),
   memoryEnabled: z.boolean().optional(),
   pluginIds: z.array(identifierSchema).default([]),
+  useNativeReply: z.boolean().default(false),
+  mentionReplySender: z.boolean().default(false),
 }).transform(policy => ({ ...policy, memoryEnabled: policy.memoryEnabled ?? policy.type === 'direct' }));
 
 export const settingsV2Schema = z.strictObject({

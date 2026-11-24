@@ -1,4 +1,4 @@
-import { BridgeError, sha, tomorrow } from '../../contracts.ts';
+import { BridgeError, id, sha, tomorrow } from '../../contracts.ts';
 import type { Context, Decision } from '../../model.ts';
 import { MAX_AGE } from '../../policy.ts';
 import { errorCode, type ErrorCode } from '../contracts/errors.ts';
@@ -18,6 +18,7 @@ type Options = {
   accountId: string; journal: JournalV2; transmitter: TransmitService;
   fence: () => Fence; generate: (turn: string[], context: Context[], grant: Grant, signal: AbortSignal) => Promise<Decision>;
   prewarm?: (grant: Grant) => void;
+  capabilities?: () => { nativeReply: boolean; mentionSend: boolean };
   onStatus?: (status: SessionRuntimeState) => void; onScheduleCancelled?: (reason: ErrorCode) => void;
   onTrace?: (stage: SessionTraceEntry['stage'], level: SessionTraceEntry['level'], summary: string, code?: ErrorCode) => void;
   workingMaxMessages?: number; workingTtlMs?: number; debounceMs?: number; batchMaxMs?: number;
@@ -435,9 +436,11 @@ export class ConversationActor {
       }
       sending = true;
       const fence = this.options.fence();
+      const { messageRef, mentionUserIds } = this.replyTarget(turn);
       this.show('checking');
       const receipt = await this.options.transmitter.send({ sourceKind: 'auto', conversationId: this.policy.conversationId,
         text: outcome.text, attemptId: this.options.transmitter.autoAttempt(this.peer, [...refs]),
+        ...(messageRef && { messageRef }), ...(mentionUserIds && { mentionUserIds }),
         expectedIdentity: fence.identity, fenceCursor: fence, originGuard: 'live_or_human', origin: 'live', checkStillValid: check,
         onWire: () => {
           this.options.onTrace?.('send', 'info', '正在提交微信发信');
@@ -464,6 +467,19 @@ export class ConversationActor {
       if (this.generation === controller) this.generation = undefined;
       this.debounce();
     }
+  }
+
+  /** 依据会话开关与小禾能力决定是否原生引用回复、是否 @ 本轮发言人；能力缺失时降级为普通发信。 */
+  private replyTarget(turn: readonly NormalizedEvent[]) {
+    const caps = this.options.capabilities?.() ?? { nativeReply: false, mentionSend: false };
+    const latest = turn.at(-1);
+    const messageRef = this.policy.useNativeReply && caps.nativeReply && latest && id(latest.messageRef) ? latest.messageRef : undefined;
+    let mentionUserIds: string[] | undefined;
+    if (this.policy.type === 'group' && this.policy.mentionReplySender && caps.mentionSend) {
+      const senders = [...new Set(turn.filter(event => !event.isSelf && id(event.senderId)).map(event => event.senderId))].slice(0, 50);
+      if (senders.length) mentionUserIds = senders;
+    }
+    return { messageRef, mentionUserIds };
   }
 
   schedule(text: string, request: string, scheduledAt?: number) {

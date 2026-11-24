@@ -277,6 +277,91 @@ final class MemoryDraftBuffer: ObservableObject {
     @Published var texts: [MemoryTarget: String] = [:]
 }
 
+// MARK: - 云端可见性概览
+
+struct MemoryVisibilitySummary: Equatable {
+    var cloudSafe = 0
+    var localOnly = 0
+    var locked = 0
+
+    init(rows: [MemoryEntryRow]) {
+        for row in rows {
+            if row.visibility == .cloudSafe { cloudSafe += 1 } else { localOnly += 1 }
+            if row.locked { locked += 1 }
+        }
+    }
+
+    var total: Int { cloudSafe + localOnly }
+    var text: String { "云端可用 \(cloudSafe) 条 · 仅本机 \(localOnly) 条 · 已锁定 \(locked) 条" }
+
+    // 批量切换只动引擎管理的未锁定条目；手写行与锁定条目保持原状。
+    static func bulkTargets(_ rows: [MemoryEntryRow], to visibility: MemoryVisibility) -> [String] {
+        rows.filter { $0.managed && !$0.locked && $0.visibility != visibility }.map(\.id)
+    }
+
+    // 会话专档看该会话的回复模型（未指定则跟随主模型）；人格档案被所有会话共享，任一会话走云端即算。
+    static func usesCloudModel(_ settings: SettingsV2, target: MemoryTarget) -> Bool {
+        func cloud(_ presetId: String?) -> Bool {
+            guard let presetId else { return false }
+            return settings.models.first { $0.id == presetId }?.mode == .cloud
+        }
+        let main = settings.defaultModels.replyPresetId
+        switch target {
+        case .persona:
+            return cloud(main) || settings.conversations.values.contains { cloud($0.replyPresetId) }
+        case .scope(let id):
+            return cloud(settings.conversations[id]?.replyPresetId ?? main)
+        }
+    }
+
+    func cloudNotice(usesCloud: Bool) -> String? {
+        usesCloud && cloudSafe == 0 && total > 0 ? "当前没有设为云端可用的条目，云模型回复不会读取此档案。" : nil
+    }
+}
+
+private struct MemoryVisibilityBar: View {
+    let summary: MemoryVisibilitySummary
+    let notice: String?
+    let toCloud: Int
+    let toLocal: Int
+    let busy: Bool
+    let blocked: Bool
+    let apply: (MemoryVisibility) -> Void
+
+    @State private var confirmingCloud = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "cloud").foregroundStyle(.secondary).accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("云端可见性概览").font(.callout.weight(.medium))
+                    Text(summary.text).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("memory-visibility-summary")
+                }
+                Spacer(minLength: 6)
+                if busy { ProgressView().controlSize(.small) }
+                Button("未锁定项全部设为云端可用") { confirmingCloud = true }
+                    .disabled(busy || blocked || toCloud == 0)
+                    .accessibilityIdentifier("memory-bulk-cloud")
+                    .confirmationDialog("把 \(toCloud) 条未锁定条目设为云端可用？", isPresented: $confirmingCloud,
+                                        titleVisibility: .visible) {
+                        Button("设为云端可用") { apply(.cloudSafe) }
+                        Button("取消", role: .cancel) {}
+                    } message: {
+                        Text("这些条目会随回复请求发送给云端模型。每条都会留下快照，可在历史版本中回滚。")
+                    }
+                Button("未锁定项全部设为仅本机") { apply(.localOnly) }
+                    .disabled(busy || blocked || toLocal == 0)
+                    .accessibilityIdentifier("memory-bulk-local")
+            }
+            if let notice { InlineNotice(text: notice, tone: .warning) }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .accessibilityIdentifier("memory-visibility-bar")
+    }
+}
+
 // MARK: - 主视图
 
 struct MemoryView: View {
@@ -401,17 +486,20 @@ private struct MemoryDocumentPane: View {
     @ObservedObject private var runtime: BridgeRuntime
     @ObservedObject private var memory: MemoryStore
     @ObservedObject private var drafts: MemoryDraftBuffer
+    @ObservedObject private var settings: SettingsStore
     let target: MemoryTarget
 
     @State private var mode = Mode.entries
     @State private var history = false
     @State private var loading = false
+    @State private var bulkBusy = false
 
     init(workspace: V2Workspace, target: MemoryTarget) {
         self.workspace = workspace
         runtime = workspace.runtime
         memory = workspace.memory
         drafts = workspace.memoryDrafts
+        settings = workspace.settings
         self.target = target
     }
 
@@ -433,6 +521,10 @@ private struct MemoryDocumentPane: View {
             VStack(spacing: 0) {
                 toolbar
                 Divider()
+                if editable && !rows.isEmpty {
+                    visibilityBar
+                    Divider()
+                }
                 main.frame(maxWidth: .infinity, maxHeight: .infinity)
                 if dirty { draftBar }
             }
@@ -449,6 +541,26 @@ private struct MemoryDocumentPane: View {
         loading = true
         defer { loading = false }
         do { try await memory.load(target) } catch { workspace.capture(error) }
+    }
+
+    private var visibilityBar: some View {
+        let summary = MemoryVisibilitySummary(rows: rows)
+        let notice = summary.cloudNotice(usesCloud: MemoryVisibilitySummary.usesCloudModel(settings.saved, target: target))
+        return MemoryVisibilityBar(summary: summary, notice: notice,
+                                   toCloud: MemoryVisibilitySummary.bulkTargets(rows, to: .cloudSafe).count,
+                                   toLocal: MemoryVisibilitySummary.bulkTargets(rows, to: .localOnly).count,
+                                   busy: bulkBusy, blocked: dirty || !runtime.ready, apply: bulkSet)
+    }
+
+    private func bulkSet(_ visibility: MemoryVisibility) {
+        let ids = MemoryVisibilitySummary.bulkTargets(rows, to: visibility)
+        guard !ids.isEmpty, !dirty else { return }
+        bulkBusy = true
+        let memory = memory, target = target
+        workspace.run {
+            defer { bulkBusy = false }
+            try await memory.setEntriesVisibility(target, entryIds: ids, visibility: visibility)
+        }
     }
 
     private var toolbar: some View {

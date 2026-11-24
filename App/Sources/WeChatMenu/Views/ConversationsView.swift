@@ -566,6 +566,7 @@ private struct ConversationDetail: View {
                     Text("跟随主模型").tag(String?.none)
                     ForEach(settings.draft.models.filter { $0.kind == .chat }) { Text($0.name).tag(String?.some($0.id)) }
                 }
+                replyStyleToggles
                 LabeledContent("开启时载入上下文") {
                     Stepper(value: binding(\.backfillOnArmCount), in: 0...500, step: 5) {
                         Text("最近 \(policy.backfillOnArmCount) 条").monospacedDigit()
@@ -607,6 +608,37 @@ private struct ConversationDetail: View {
                     turnActionRow("图片/语音无法解析时", riskBinding(\.unparsedMediaAction))
                 }
             }
+        }
+    }
+
+    // 能力未就绪时开关仍可保存：引擎在发信时按实际能力回退为普通文本，不会因此失败。
+    @ViewBuilder private var replyStyleToggles: some View {
+        let hint = ReplyStyleHint(capabilities: runtime.capabilities)
+        Toggle(isOn: binding(\.useNativeReply)) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("优先引用原消息回复")
+                if let text = hint.nativeReply {
+                    Text(text).font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("回复时引用触发本轮的那条消息，让对方一眼看出在回哪句").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .toggleStyle(.switch)
+        .accessibilityIdentifier("conversation-native-reply")
+        if policy.type == .group {
+            Toggle(isOn: binding(\.mentionReplySender)) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("群聊回复时 @ 提问成员")
+                    if let text = hint.mentionSend {
+                        Text(text).font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("自动在回复开头 @ 本轮提问的成员").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .toggleStyle(.switch)
+            .accessibilityIdentifier("conversation-mention-sender")
         }
     }
 
@@ -1011,5 +1043,16 @@ private struct PickerRow: View {
             if managed { StatusPill(text: "已加入", tone: .active) }
             else { Button("加入", action: add).controlSize(.small).disabled(!supported) }
         }
+    }
+}
+
+// 引用回复与 @ 成员依赖小禾插件能力；未就绪时给出灰色说明，nil 表示能力可用。
+struct ReplyStyleHint: Equatable {
+    let nativeReply: String?
+    let mentionSend: String?
+
+    init(capabilities: XiaoheCapabilities?) {
+        nativeReply = capabilities?.nativeReply == true ? nil : "当前 X1a0HeWeChatPlugin 未开启引用回复能力，将按普通文本回复"
+        mentionSend = capabilities?.mentionSend == true ? nil : "当前 X1a0HeWeChatPlugin 未开启 @ 成员能力，将按普通文本回复"
     }
 }

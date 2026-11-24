@@ -6,6 +6,8 @@ const nonnegativeInt = z.number().int().nonnegative();
 const httpUrl = z.url({ protocol: /^https?$/ });
 const clockTime = z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/);
 
+export const webhookPlatformSchema = z.enum(['generic', 'feishu', 'wecom', 'telegram', 'notion']);
+
 export const pluginSinkConfigSchema = z.discriminatedUnion('type', [
   z.strictObject({ id: identifierSchema, type: z.literal('app_feed'), notifyDesktop: z.boolean() }),
   z.strictObject({
@@ -15,7 +17,8 @@ export const pluginSinkConfigSchema = z.discriminatedUnion('type', [
   z.strictObject({
     id: identifierSchema, type: z.literal('wechat'), targetConversationId: identifierSchema, approved: z.boolean(),
   }),
-  z.strictObject({ id: identifierSchema, type: z.literal('webhook'), url: httpUrl, hasSecret: z.boolean() }),
+  z.strictObject({ id: identifierSchema, type: z.literal('webhook'), url: httpUrl, hasSecret: z.boolean(),
+    platform: webhookPlatformSchema.optional() }),
 ]);
 
 const triggerSchema = z.discriminatedUnion('type', [
@@ -38,7 +41,7 @@ export const declarativePluginConfigSchema = z.strictObject({
   name: z.string().min(1),
   description: z.string(),
   enabled: z.boolean(),
-  builtinTemplate: z.enum(['group-digest', 'keyword-alert', 'custom']).optional(),
+  builtinTemplate: z.enum(['group-digest', 'keyword-alert', 'daily-briefing', 'custom']).optional(),
   scope: z.strictObject({
     conversationIds: z.array(identifierSchema),
     includeTypes: z.array(scopeTypeSchema).optional(),
@@ -88,4 +91,5 @@ export type DeclarativePluginConfig = z.infer<typeof declarativePluginConfigSche
 export type PluginSinkConfig = z.infer<typeof pluginSinkConfigSchema>;
 export type PluginManifest = z.infer<typeof pluginManifestSchema>;
 export type PluginPermission = z.infer<typeof pluginPermissionSchema>;
+export type WebhookPlatform = z.infer<typeof webhookPlatformSchema>;
 export type GroupDigestOutput = z.infer<typeof groupDigestOutputSchema>;

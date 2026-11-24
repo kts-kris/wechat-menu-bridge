@@ -1,6 +1,7 @@
 import { lstatSync, readdirSync, unlinkSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { sha } from '../../contracts.ts';
+import { errorCode, type ErrorCode } from '../contracts/errors.ts';
 import type { ModelRouter } from '../llm/router.ts';
 import { assertPrivateFile, atomicWritePrivateFile, ensurePrivateDir, readPrivateFile } from '../storage/fs-safe.ts';
 import type { MediaBlock, Scope, XiaoheClient } from './client.ts';
@@ -10,7 +11,9 @@ const CACHE_BYTES = 128 * 1024 * 1024;
 const CACHE_TTL = 24 * 60 * 60_000;
 const MEDIA_BYTES = 8 * 1024 * 1024;
 type MediaOptions = { visionPresetId?: string; sttPresetId?: string; allowDownload?: boolean;
-  cloudApproved?: boolean; priority?: 'reply' | 'background' };
+  cloudApproved?: boolean; priority?: 'reply' | 'background';
+  /** 降级时回传原因码（不含任何媒体正文），供会话轨迹展示。 */
+  onDegraded?: (code: ErrorCode) => void };
 const supported = (block: MediaBlock) => block.type === 'image' ?
   /^image\/(?:jpeg|png|gif|webp)$/.test(block.mimeType) :
   /^audio\/(?:wav|x-wav|mpeg|ogg|mp4|webm|flac)$/.test(block.mimeType);
@@ -70,8 +73,13 @@ export class MediaEnricher {
     if (!image && event.text.trim() && !/^\[(?:语音|voice)\]$/i.test(event.text.trim())) {
       return { ...input, event: { ...event, media: { enrichmentStatus: 'ok', transcript: event.text } } };
     }
-    const degraded: EventInput = { ...input, event: { ...event, text: image ? '[图片]' : '[语音]', media: { enrichmentStatus: 'degraded' } } };
-    if (!preset || !mediaRef) return degraded;
+    const fallback: EventInput = { ...input, event: { ...event, text: image ? '[图片]' : '[语音]', media: { enrichmentStatus: 'degraded' } } };
+    const degraded = (code: ErrorCode) => {
+      try { options.onDegraded?.(code); } catch { /* 观察者不影响降级结果 */ }
+      return fallback;
+    };
+    if (!preset) return degraded('invalid-configuration');
+    if (!mediaRef) return degraded('mcp-contract');
     const timer = AbortSignal.timeout(10_000);
     const bounded = signal ? AbortSignal.any([signal, timer]) : timer;
     try {
@@ -81,14 +89,17 @@ export class MediaEnricher {
       if (!this.subscribed(event.conversationId)) return input;
       const blocks = media.blocks.filter(block => block.type === (image ? 'image' : 'audio') && valid(block)).slice(0, image ? 3 : 1);
       const first = blocks[0];
-      if (!first) return degraded;
+      if (!first) return degraded('mcp-contract');
       const path = this.cache(JSON.stringify([input.identity, scope.conversation_id, mediaRef]), first);
       const modelOptions = { signal: bounded, priority: options.priority, cloudApproved: options.cloudApproved };
       const text = (await (image ? this.models.vision(preset, blocks, modelOptions) :
         this.models.stt(preset, first, modelOptions))).trim().slice(0, 2000);
-      if (!text || bounded.aborted) return degraded;
+      if (bounded.aborted) return degraded(signal?.aborted ? 'stopped' : 'model-timeout');
+      if (!text) return degraded('model-format');
       return { ...input, event: { ...event, text, media: { mimeType: first.mimeType, localTempPath: path,
         enrichmentStatus: 'ok', ...(image ? { caption: text } : { transcript: text }) } } };
-    } catch { return degraded; }
+    } catch (error) {
+      return degraded(signal?.aborted ? 'stopped' : timer.aborted ? 'model-timeout' : errorCode(error));
+    }
   }
 }

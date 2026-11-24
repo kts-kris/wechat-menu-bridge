@@ -215,6 +215,7 @@ export class BridgeOrchestrator {
       workingMaxMessages: this.settings.memory.workingMaxMessages,
       workingTtlMs: this.settings.memory.workingTtlMinutes * 60_000, ...this.options.actorTiming,
       fence: () => connection.ingest.fence(id),
+      capabilities: () => ({ nativeReply: this.capabilities.nativeReply, mentionSend: this.capabilities.mentionSend }),
       onTrace: (stage, level, summary, code) => this.emitTrace(id, stage, level, summary, code),
       prewarm: () => {
         const current = actor?.policy ?? policy;
@@ -346,6 +347,7 @@ export class BridgeOrchestrator {
     this.mediaAbort.set(id, controller);
     this.track((async () => {
       let enriched = input;
+      let mediaStarted = false;
       try {
         const remote = await connection.client.identify(event.accountId, controller.signal);
         if (identityKey(remote) !== input.identity) throw new BridgeError('wechat-changed');
@@ -355,10 +357,17 @@ export class BridgeOrchestrator {
         const mediaPresetId = event.kind === 'image' ? visionPresetId : sttPresetId;
         const mediaCloudApproved = (forReply && actor?.cloudApproved) ||
           (!!mediaPresetId && this.settings.runtime.approvedCloudPresetIds.includes(mediaPresetId));
-        if (isMedia) enriched = await this.media.enrich(input, scope, connection.client, {
-          visionPresetId, sttPresetId,
-          priority: forReply ? 'reply' : 'background', cloudApproved: mediaCloudApproved,
-        }, controller.signal);
+        if (isMedia) {
+          let failure: ErrorCode | undefined;
+          const started = performance.now();
+          mediaStarted = true;
+          enriched = await this.media.enrich(input, scope, connection.client, {
+            visionPresetId, sttPresetId,
+            priority: forReply ? 'reply' : 'background', cloudApproved: mediaCloudApproved,
+            onDegraded: code => { failure = code; },
+          }, controller.signal);
+          this.traceMedia(event, enriched, Math.round(performance.now() - started), failure);
+        }
         if (forReply && !controller.signal.aborted && this.connection === connection) actor?.completeMedia(enriched);
         if (needName) {
           const member = (await connection.client.groupMembers(scope, controller.signal)).find(v => v.userId === event.senderId);
@@ -366,11 +375,23 @@ export class BridgeOrchestrator {
         }
       } catch (error) {
         if (errorCode(error) === 'wechat-changed') this.pauseAll('all', 'wechat-changed');
+        if (isMedia && !mediaStarted) this.traceMedia(event, undefined, 0, controller.signal.aborted ? 'stopped' : errorCode(error));
         if (forReply && !controller.signal.aborted && this.connection === connection) actor?.completeMedia(enriched);
       }
       if (!controller.signal.aborted && this.connection === connection && this.listening.has(id) &&
           !this.journal.isRecalled(input.route, eventRefHash(input))) void this.bus.publish('message', eventSnapshot(enriched.event));
     })());
+  }
+
+  /** 只记录耗时与原因码，绝不写入图片描述或语音转写正文。 */
+  private traceMedia(event: NormalizedEvent, enriched: EventInput | undefined, ms: number, failure?: ErrorCode) {
+    if (event.origin !== 'live') return;
+    const label = event.kind === 'image' ? '图片' : '语音';
+    const status = enriched?.event.media?.enrichmentStatus;
+    if (status === 'ok') this.emitTrace(event.conversationId, 'inbound', 'info', `${label}解析完成（耗时 ${ms}ms）`);
+    else if (!enriched || status === 'degraded' || status === 'failed') {
+      this.emitTrace(event.conversationId, 'inbound', 'warn', `${label}解析失败（${failure ?? 'internal-error'}）`);
+    }
   }
 
   async setReadOnlySubscriptions(ids: Iterable<string>) {

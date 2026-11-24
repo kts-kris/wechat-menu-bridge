@@ -55,6 +55,7 @@ export async function mockNetwork(options: { v2?: boolean; token?: string } = {}
     afterReadSnapshot: undefined as (() => void) | undefined,
     accountWideEvents: true, historyEmptyPage: false, mediaUnavailable: false,
     sendConversations: [peer, secondPeer, group], failConversation: undefined as string | undefined,
+    hideReplyTool: false, hideMentionSend: false,
   };
   const v2Scopes = [peer, secondPeer, group, service, 'another-group@chatroom'];
   const toolNames = ['system.status', 'accounts.list', 'contacts.search', 'conversations.list', 'groups.members',
@@ -99,10 +100,10 @@ export async function mockNetwork(options: { v2?: boolean; token?: string } = {}
     if (m.method?.startsWith('notifications/')) return res.writeHead(202).end();
     if (options.v2 && m.method === 'tools/list') {
       calls.push({ name: 'tools/list', args: m.params ?? {}, at: Date.now(), session: sessionId(req) });
-      const tools = toolNames.map(name => {
+      const tools = toolNames.filter(name => !(state.hideReplyTool && name === 'messages.reply')).map(name => {
         const events = name.startsWith('events.');
         const properties = { ...(events && { account_id: { type: 'string' }, conversation_id: { type: 'string' } }),
-          ...((name === 'messages.send_text' || name === 'messages.reply') && { mention_user_ids: { type: 'array' } }) };
+          ...((name === 'messages.send_text' || name === 'messages.reply') && !state.hideMentionSend && { mention_user_ids: { type: 'array' } }) };
         return { name, inputSchema: { type: 'object', properties, ...(events && {
           required: ['account_id', ...(!state.accountWideEvents ? ['conversation_id'] : [])],
         }) } };

@@ -4,7 +4,7 @@ import { errorCodeSchema } from './errors.ts';
 import {
   backfillProgressSchema, backfillRequestSchema, identifierSchema, scopeTypeSchema, timestampSchema, xiaoheCapabilitiesSchema,
 } from './events.ts';
-import { declarativePluginConfigSchema, pluginManifestSchema, pluginPermissionSchema } from './plugins.ts';
+import { declarativePluginConfigSchema, pluginManifestSchema, pluginPermissionSchema, webhookPlatformSchema } from './plugins.ts';
 import { settingsV2Schema } from './settings.ts';
 
 export const IPC_VERSION = 3;
@@ -182,7 +182,13 @@ export const hotBundlesStatusSchema = z.strictObject({
 
 export const rpcSchemas = {
   'system.status': { params: empty, result: status },
-  'system.bundles': { params: z.strictObject({ action: z.enum(['status', 'reload']) }), result: hotBundlesStatusSchema },
+  'system.bundles': {
+    params: z.strictObject({
+      action: z.enum(['status', 'reload', 'sync', 'reset']),
+      manifestUrl: z.url({ protocol: /^https$/ }).optional(),
+    }),
+    result: hotBundlesStatusSchema,
+  },
   'system.healthCheck': {
     params: z.strictObject({ presetId: identifierSchema.optional(), conversationId: identifierSchema.optional() }),
     result: z.strictObject({ ok: z.boolean(), steps: z.array(healthCheckStepSchema) }),
@@ -248,6 +254,20 @@ export const rpcSchemas = {
     result: z.strictObject({ runId: identifierSchema }),
   },
   'plugins.runs': { params: plugin.extend(page), result: paginated(pluginRun) },
+  'plugins.testWebhook': {
+    params: z.strictObject({
+      pluginId: identifierSchema,
+      sinkId: identifierSchema,
+      url: z.url({ protocol: /^https?$/ }),
+      platform: webhookPlatformSchema.optional(),
+      secret: z.string().regex(/^[\x20-\x7e]{1,4096}$/).optional(),
+    }),
+    result: z.strictObject({
+      ok: z.boolean(),
+      statusCode: z.number().int().nonnegative().optional(),
+      detail: z.string().max(300),
+    }),
+  },
   'memory.get': { params: z.strictObject({ target: memoryTarget }), result: memoryContent },
   'memory.save': { params: z.strictObject({ target: memoryTarget, content: memoryContent }), result: revision },
   'memory.setEntryLock': {

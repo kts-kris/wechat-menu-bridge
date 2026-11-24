@@ -102,6 +102,7 @@ export class PluginManager {
     'plugins.setEnabled': params => this.setEnabled(params),
     'plugins.runNow': params => this.runNow(params),
     'plugins.runs': params => this.runs(params),
+    'plugins.testWebhook': params => { this.available(); return this.sinks.testWebhook(params); },
   };
 
   list(_params?: RpcParams<'plugins.list'>): RpcResult<'plugins.list'> {

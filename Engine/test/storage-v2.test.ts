@@ -306,8 +306,9 @@ test('事件、插件与 IPC v3 契约保留实际字段并验证方法对应载
   expect(MAX_FRAME_BYTES).toBe(262_144);
   expect(PUSH_TOPICS).toHaveLength(8);
   expect(PUSH_TOPICS).toContain('session.trace');
-  expect(RPC_METHODS).toHaveLength(35);
+  expect(RPC_METHODS).toHaveLength(36);
   expect(RPC_METHODS).toContain('system.bundles');
+  expect(RPC_METHODS).toContain('plugins.testWebhook');
   expect(RPC_METHODS).toEqual(expect.arrayContaining(['session.traces', 'session.resumeCooldown', 'system.healthCheck']));
   expect(rpcRequestSchema.safeParse({ v: 3, id: 1, method: 'session.traces',
     params: { conversationId: 'friend-alias', limit: 101 } }).success).toBe(false);
