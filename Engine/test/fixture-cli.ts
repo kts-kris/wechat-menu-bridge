@@ -1,7 +1,8 @@
 import { event, mockNetwork } from './fixture.ts';
 
 // Only started by tests; this second port isn't compiled into the app.
-const f = await mockNetwork();
+// --v2 serves the MCP v2 surface the bundled v3 engine probes (tools/list, conversations).
+const f = await mockNetwork({ v2: process.argv.includes('--v2') });
 let serial = 0;
 const control = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(req) {
   const path = new URL(req.url).pathname;
