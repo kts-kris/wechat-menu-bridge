@@ -454,6 +454,164 @@ final class V2ViewTests: XCTestCase {
             feedback: FeedbackDraft(category: .model, title: "默认仓库测试", details: "验证默认预填")
         ))
         XCTAssertEqual(defaultURL.path, "/kts-kris/wechat-menu-bridge/issues/new")
+        let light = try snapshot(FeedbackSheet(workspace: workspace, submitter: GitHubIssueSubmitter(vault: KeychainVault(fileDirectory: directory), ghSearchPaths: [])) {}, appearance: .aqua, size: CGSize(width: 600, height: 640))
+        let dark = try snapshot(FeedbackSheet(workspace: workspace, submitter: GitHubIssueSubmitter(vault: KeychainVault(fileDirectory: directory), ghSearchPaths: [])) {}, appearance: .darkAqua, size: CGSize(width: 600, height: 640))
+        XCTAssertNotEqual(light, dark)
+    }
+
+    func testGitHubIssuePayloadRedactsSecretsAndIncludesDiagnostics() throws {
+        let feedback = FeedbackDraft(category: .model, title: "模型调用 sk-secret123456 报错", details: "ghp_1234567890abcdef1234567890 失败")
+        let payload = try XCTUnwrap(DiagnosticBundleBuilder.issuePayload(
+            repository: "https://github.com/kts-kris/wechat-menu-bridge.git",
+            snapshot: diagnosticSnapshot(),
+            logLines: [#"{"at":1700000000000,"stage":"model","level":"error","summary":"api_key=abc123456789 timeout","code":"model-timeout"}"#],
+            feedback: feedback,
+            includeDiagnostics: true
+        ))
+        XCTAssertEqual(payload.repository, "kts-kris/wechat-menu-bridge")
+        XCTAssertEqual(payload.labels, ["bug", "bug/llm"])
+        XCTAssertTrue(payload.title.hasPrefix("[模型与回复] "))
+        XCTAssertFalse(payload.title.contains("sk-secret123456"))
+        XCTAssertFalse(payload.body.contains("ghp_1234567890"))
+        XCTAssertFalse(payload.body.contains("abc123456789"))
+        XCTAssertTrue(payload.body.contains("<details>"))
+        XCTAssertTrue(payload.body.contains("model-timeout"))
+
+        let withoutDiag = try XCTUnwrap(DiagnosticBundleBuilder.issuePayload(
+            repository: DiagnosticBundleBuilder.defaultRepository,
+            snapshot: diagnosticSnapshot(),
+            logLines: [],
+            feedback: FeedbackDraft(category: .experience, title: "界面优化建议", details: "详情"),
+            includeDiagnostics: false
+        ))
+        XCTAssertEqual(withoutDiag.labels, ["enhancement", "bug/ui"])
+        XCTAssertFalse(withoutDiag.body.contains("<details>"))
+
+        // 标题为空或仓库不合法时拒绝构造自动提交载荷。
+        XCTAssertNil(DiagnosticBundleBuilder.issuePayload(repository: DiagnosticBundleBuilder.defaultRepository,
+                                                          snapshot: diagnosticSnapshot(), logLines: [],
+                                                          feedback: FeedbackDraft(category: .malfunction, title: "   ", details: "x")))
+        XCTAssertNil(DiagnosticBundleBuilder.issuePayload(repository: "not-a-repo",
+                                                          snapshot: diagnosticSnapshot(), logLines: [],
+                                                          feedback: FeedbackDraft(category: .malfunction, title: "标题", details: "x")))
+    }
+
+    func testGitHubIssueSubmitterPostsViaRESTAPIAndRetriesWithoutUnknownLabels() async throws {
+        final class Box<T>: @unchecked Sendable {
+            private let lock = NSLock()
+            var value: T
+            init(_ value: T) { self.value = value }
+            func withLock<R>(_ body: (inout T) -> R) -> R { lock.withLock { body(&value) } }
+        }
+        let vault = KeychainVault(fileDirectory: directory)
+        let captured = Box<[URLRequest]>([])
+        let submitter = GitHubIssueSubmitter(
+            vault: vault,
+            ghSearchPaths: [],
+            httpTransport: { request in
+                let attempt = captured.withLock { list -> Int in
+                    list.append(request)
+                    return list.count
+                }
+                let url = request.url!
+                if attempt == 1 {
+                    let body = Data(#"{"message":"Validation Failed","errors":[{"field":"labels","code":"invalid"}]}"#.utf8)
+                    return (body, HTTPURLResponse(url: url, statusCode: 422, httpVersion: nil, headerFields: nil)!)
+                }
+                let body = Data(#"{"number":42,"html_url":"https://github.com/kts-kris/wechat-menu-bridge/issues/42","title":"[模型与回复] 测试标题"}"#.utf8)
+                return (body, HTTPURLResponse(url: url, statusCode: 201, httpVersion: nil, headerFields: nil)!)
+            }
+        )
+        try submitter.saveToken("ghp_local_test_token_123456")
+        XCTAssertEqual(submitter.detectAvailability(), .savedToken)
+
+        // Token 仅存入 0600 secrets.json，绝不写入 settings.json。
+        let secretsPath = directory.appendingPathComponent("secrets.json").path
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secretsPath))
+        let attrs = try FileManager.default.attributesOfItem(atPath: secretsPath)
+        XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("settings.json").path))
+
+        let payload = try XCTUnwrap(DiagnosticBundleBuilder.issuePayload(
+            repository: DiagnosticBundleBuilder.defaultRepository,
+            snapshot: diagnosticSnapshot(), logLines: [],
+            feedback: FeedbackDraft(category: .model, title: "测试标题", details: "测试复现")
+        ))
+        let created = try await submitter.submit(payload)
+        let requests = captured.withLock { $0 }
+        XCTAssertEqual(created.number, 42)
+        XCTAssertEqual(created.url.absoluteString, "https://github.com/kts-kris/wechat-menu-bridge/issues/42")
+        XCTAssertEqual(created.via, .token)
+        XCTAssertEqual(requests.count, 2, "标签校验失败时自动去掉 labels 重试一次")
+        XCTAssertEqual(requests[0].url?.absoluteString, "https://api.github.com/repos/kts-kris/wechat-menu-bridge/issues")
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Authorization"), "Bearer ghp_local_test_token_123456")
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Accept"), "application/vnd.github+json")
+        let firstJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(requests[0].httpBody)) as? [String: Any])
+        let secondJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(requests[1].httpBody)) as? [String: Any])
+        XCTAssertEqual(firstJSON["labels"] as? [String], ["bug", "bug/llm"])
+        XCTAssertNil(secondJSON["labels"])
+
+        try submitter.removeToken()
+        XCTAssertEqual(submitter.detectAvailability(), .unavailable)
+    }
+
+    func testGitHubIssueSubmitterFallsBackToGHCLIAndRejectsRedirects() async throws {
+        final class Box<T>: @unchecked Sendable {
+            private let lock = NSLock()
+            var value: T
+            init(_ value: T) { self.value = value }
+            func withLock<R>(_ body: (inout T) -> R) -> R { lock.withLock { body(&value) } }
+        }
+        let fakeGH = directory.appendingPathComponent("fake-gh")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: fakeGH)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeGH.path)
+
+        let invocations = Box<[([String], Data?)]>([])
+        let cliSubmitter = GitHubIssueSubmitter(
+            vault: KeychainVault(fileDirectory: directory),
+            ghSearchPaths: [fakeGH.path],
+            processRunner: { _, args, stdin in
+                invocations.withLock { $0.append((args, stdin)) }
+                if args.first == "auth" {
+                    return .init(exitCode: 0, stdout: Data("Logged in".utf8), stderr: Data())
+                }
+                let ok = Data(#"{"number":99,"html_url":"https://github.com/kts-kris/wechat-menu-bridge/issues/99","title":"[功能故障] CLI 提交"}"#.utf8)
+                return .init(exitCode: 0, stdout: ok, stderr: Data())
+            }
+        )
+        XCTAssertEqual(cliSubmitter.detectAvailability(), .ghCLI(path: fakeGH.path))
+        let payload = try XCTUnwrap(DiagnosticBundleBuilder.issuePayload(
+            repository: DiagnosticBundleBuilder.defaultRepository,
+            snapshot: diagnosticSnapshot(), logLines: [],
+            feedback: FeedbackDraft(category: .malfunction, title: "CLI 提交", details: "自动走 gh api")
+        ))
+        let created = try await cliSubmitter.submit(payload)
+        let calls = invocations.withLock { $0 }
+        XCTAssertEqual(created.number, 99)
+        XCTAssertEqual(created.via, .ghCLI)
+        XCTAssertEqual(calls.last?.0.contains("repos/kts-kris/wechat-menu-bridge/issues"), true)
+        XCTAssertEqual(calls.last?.0.contains("--input"), true)
+        let stdinJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(calls.last?.1)) as? [String: Any])
+        XCTAssertEqual(stdinJSON["labels"] as? [String], ["bug"])
+
+        // 显式 Token 遇到 302 重定向必须拒绝，避免凭证外泄。
+        let redirectSubmitter = GitHubIssueSubmitter(
+            vault: KeychainVault(fileDirectory: directory),
+            ghSearchPaths: [],
+            httpTransport: { req in
+                (Data(), HTTPURLResponse(url: req.url!, statusCode: 302, httpVersion: nil, headerFields: ["Location": "https://evil.example/"])!)
+            }
+        )
+        do {
+            _ = try await redirectSubmitter.submit(payload, explicitToken: "ghp_token_should_not_redirect")
+            XCTFail("302 重定向必须被拒绝")
+        } catch let error as GitHubIssueSubmitter.SubmitError {
+            if case .networkFailure(let detail) = error {
+                XCTAssertTrue(detail.contains("重定向"))
+            } else {
+                XCTFail("意外错误类型: \(error)")
+            }
+        }
     }
 
     func testConversationStatusDotPriority() {

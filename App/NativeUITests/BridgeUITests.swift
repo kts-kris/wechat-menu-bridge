@@ -79,10 +79,12 @@ final class BridgeUITests: XCTestCase {
         let repository = control("feedback-repository", in: sheet)
         XCTAssertTrue(repository.waitForExistence(timeout: 5), sheet.debugDescription)
         XCTAssertEqual(repository.value as? String, "kts-kris/wechat-menu-bridge", "Default issue repository must be prefilled")
-        let submit = control("feedback-open-issue", in: sheet)
-        XCTAssertTrue(submit.exists && submit.isEnabled, "「打开 Issue 提交页」 must be usable with the default repository")
+        let openBrowser = control("feedback-open-issue", in: sheet)
+        XCTAssertTrue(openBrowser.exists && openBrowser.isEnabled, "「浏览器打开」 must be usable with the default repository")
+        let directSubmit = control("feedback-submit-issue", in: sheet)
+        XCTAssertTrue(directSubmit.exists && !directSubmit.isEnabled, "「提交 Issue」 must stay disabled while title is empty")
         XCTAssertTrue(control("feedback-export", in: sheet).isEnabled)
-        // Never click submit: it would open a browser outside the isolated copy.
+        // Never click submit/open: it would open a browser or hit GitHub outside the isolated copy.
         try click(sheet.buttons["完成"])
         XCTAssertTrue(sheet.waitForNonExistence(timeout: 5))
     }
