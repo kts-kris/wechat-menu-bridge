@@ -269,12 +269,24 @@ final class BridgeUITests: XCTestCase {
 
     @MainActor private func scrollIntoView(_ element: XCUIElement, in scroll: XCUIElement) throws {
         guard element.waitForExistence(timeout: 5) else { XCTFail("Missing \(element)"); return }
-        for _ in 0..<6 where !element.isHittable { scroll.scroll(byDeltaX: 0, deltaY: -480) }
+        let scrollFrame = scroll.frame
+        let isComfortablyVisible: () -> Bool = {
+            guard element.isHittable else { return false }
+            let f = element.frame
+            guard !f.isEmpty, !scrollFrame.isEmpty else { return true }
+            return f.minY >= scrollFrame.minY + 36 && f.maxY <= scrollFrame.maxY - 64
+        }
+        for _ in 0..<12 where !isComfortablyVisible() {
+            let f = element.frame
+            let dy: CGFloat = (!f.isEmpty && !scrollFrame.isEmpty && f.minY < scrollFrame.minY + 36) ? 200 : -200
+            scroll.scroll(byDeltaX: 0, deltaY: dy)
+            RunLoop.current.run(until: Date.now.addingTimeInterval(0.15))
+        }
     }
 
     @MainActor private func click(_ element: XCUIElement, in scroll: XCUIElement? = nil) throws {
         guard element.waitForExistence(timeout: 5) else { XCTFail("Missing \(element)"); return }
-        if let scroll, !element.isHittable { try scrollIntoView(element, in: scroll) }
+        if let scroll { try scrollIntoView(element, in: scroll) }
         XCTAssertTrue(element.isEnabled, "Not enabled: \(element); \(element.debugDescription)")
         element.click()
     }
@@ -449,17 +461,18 @@ final class BridgeUITests: XCTestCase {
         let ownerQuery = app.descendants(matching: .any).matching(identity)
         let host = XCUIApplication(bundleIdentifier: Self.menuBarAgent)
         let hostQuery = host.descendants(matching: .any).matching(identity)
-        var deadline = Date.now.addingTimeInterval(6)
+        var deadline = Date.now.addingTimeInterval(10)
         let start = Date.now
-        var expandedOverflow = false
+        var clickedOverflows: [CGRect] = []
+        var overflowAttempts = 0
         repeat {
-            let hostItems = hostQuery.allElementsBoundByIndex.filter(\.exists)
             let ownerItems = ownerQuery.allElementsBoundByIndex.filter(\.exists)
-            for candidate in hostItems where candidate.isHittable {
+            for candidate in ownerItems where candidate.isHittable {
                 candidate.click()
                 return
             }
-            for candidate in ownerItems where candidate.isHittable {
+            let hostItems = hostQuery.allElementsBoundByIndex.filter(\.exists)
+            for candidate in hostItems where candidate.isHittable {
                 candidate.click()
                 return
             }
@@ -467,25 +480,33 @@ final class BridgeUITests: XCTestCase {
             // isolated app and MenuBarAgent publish the exact same on-screen frame
             // for our UUID-tagged button even though cross-process hit-testing
             // reports isHittable == false. Click the verified shared frame center.
-            if expandedOverflow,
+            if !clickedOverflows.isEmpty,
                let hostMatch = hostItems.first(where: { $0.isEnabled && $0.frame.minX > 0 && $0.frame.minY >= 0 && !$0.frame.isEmpty }),
                ownerItems.contains(where: { $0.frame == hostMatch.frame }) {
                 hostMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
                 return
             }
             // macOS 27 MenuBarAgent collapses excess status items behind its own
-            // overflow button (and may omit them from AX until expanded). Expand
-            // that system button once if our item has not surfaced after startup.
-            if !expandedOverflow,
-               !hostItems.isEmpty || Date.now.timeIntervalSince(start) >= 1.5 {
-                let overflow = host.buttons["menu-bar-overflow-indicator"]
-                if overflow.exists && overflow.isHittable {
+            // overflow button (and may omit them from AX until expanded). On multi-
+            // display Macs prefer the external/widest display (largest minX) and
+            // cap attempts at 2 so AX queries never spin toward test timeout.
+            if overflowAttempts < 2 && (!hostItems.isEmpty || Date.now.timeIntervalSince(start) >= 1.2) {
+                let overflows = host.buttons.matching(identifier: "menu-bar-overflow-indicator").allElementsBoundByIndex
+                    .filter { btn in
+                        btn.exists && btn.isHittable &&
+                        !clickedOverflows.contains { abs($0.minX - btn.frame.minX) < 12 && abs($0.minY - btn.frame.minY) < 12 }
+                    }
+                    .sorted { $0.frame.minX > $1.frame.minX }
+                if let overflow = overflows.first {
+                    overflowAttempts += 1
+                    clickedOverflows.append(overflow.frame)
                     overflow.click()
-                    expandedOverflow = true
-                    deadline = max(deadline, Date.now.addingTimeInterval(5))
+                    deadline = max(deadline, Date.now.addingTimeInterval(4))
+                    RunLoop.current.run(until: Date.now.addingTimeInterval(0.6))
+                    continue
                 }
             }
-            RunLoop.current.run(until: Date.now.addingTimeInterval(0.2))
+            RunLoop.current.run(until: Date.now.addingTimeInterval(0.25))
         } while Date.now < deadline
 
         let ownerItems = ownerQuery.allElementsBoundByIndex.filter(\.exists)
