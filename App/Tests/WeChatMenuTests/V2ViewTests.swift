@@ -70,6 +70,11 @@ private func temporaryDirectory() throws -> URL {
     return path
 }
 
+// 避免无头 CI 虚拟屏幕（如 1024x768）把离屏测试窗口高度截断，导致分组 Form 底部 Section 懒加载不触发 .task。
+private final class UnconstrainedTestWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+}
+
 @MainActor
 final class V2ViewTests: XCTestCase {
     private var directory: URL!
@@ -138,8 +143,8 @@ final class V2ViewTests: XCTestCase {
 
     // 放进真实窗口后截图：SwiftUI 只有在窗口内才会运行 .task 并完成完整布局。
     private func hosted<V: View>(_ view: V, size: CGSize = CGSize(width: 820, height: 2000)) -> NSWindow {
-        let window = NSWindow(contentRect: NSRect(x: -6000, y: -6000, width: size.width, height: size.height),
-                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let window = UnconstrainedTestWindow(contentRect: NSRect(x: -6000, y: -6000, width: size.width, height: size.height),
+                                             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentViewController = NSHostingController(rootView: view)
         window.setContentSize(size)
@@ -160,6 +165,14 @@ final class V2ViewTests: XCTestCase {
 
     private func settle(until condition: () -> Bool) {
         for _ in 0..<100 where !condition() { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+    }
+
+    // 在 async @MainActor 测试中需让出并发执行器，SwiftUI .task 才能在 Swift 6.0 / macOS 15 上得到调度。
+    private func settleAsync(until condition: () -> Bool) async {
+        for _ in 0..<100 where !condition() {
+            try? await Task.sleep(nanoseconds: 25_000_000)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
     }
 
     private func pushSession(_ transport: ViewMockTransport, _ status: String, id: String = "wxid_a") {
@@ -1045,7 +1058,7 @@ final class V2ViewTests: XCTestCase {
     func testTraceCardLoadsOnSelectionAndRendersPushes() async throws {
         let (workspace, transport) = try await connectedSeeded(sessionStatus: #"{"phase":"listening","replyMode":"auto"}"#)
         let window = hosted(ConversationsView(workspace: workspace))
-        settle { transport.methods.contains("session.traces") }
+        await settleAsync { transport.methods.contains("session.traces") }
         window.close()
         XCTAssertEqual(transport.params["session.traces"]?["conversationId"] as? String, "wxid_a")
         XCTAssertEqual(transport.params["session.traces"]?["limit"] as? Int, SessionsStore.maxTraces)
@@ -1123,8 +1136,8 @@ final class V2ViewTests: XCTestCase {
     // MARK: 快速回复与软件更新
 
     private func snapshot<V: View>(_ view: V, appearance: NSAppearance.Name, size: CGSize = CGSize(width: 820, height: 2000)) throws -> Data {
-        let window = NSWindow(contentRect: NSRect(x: -6000, y: -6000, width: size.width, height: size.height),
-                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let window = UnconstrainedTestWindow(contentRect: NSRect(x: -6000, y: -6000, width: size.width, height: size.height),
+                                             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.appearance = NSAppearance(named: appearance)
         window.contentViewController = NSHostingController(rootView: view)
@@ -1180,6 +1193,9 @@ final class V2ViewTests: XCTestCase {
         let light = try snapshot(form, appearance: .aqua, size: size)
         let dark = try snapshot(form, appearance: .darkAqua, size: size)
         XCTAssertNotEqual(light, dark)
+        let bundleWindow = hosted(form, size: CGSize(width: 680, height: 900))
+        await settleAsync { transport.methods.contains("system.bundles") }
+        bundleWindow.close()
         XCTAssertEqual(transport.params["system.bundles"]?["action"] as? String, "status", "进入设置页读取资产状态")
         updater.feedURL = "http://insecure.example.invalid/appcast.xml"
         XCTAssertFalse(updater.hasValidFeed)
