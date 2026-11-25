@@ -619,8 +619,19 @@ private struct ConversationDetail: View {
                     turnActionRow("对方刷屏时", riskBinding(\.busyChatAction))
                     turnActionRow("图片/语音无法解析时", riskBinding(\.unparsedMediaAction))
                 }
+                keywordFilterRows
             }
         }
+    }
+
+    private var keywordFilterRows: some View {
+        KeywordFilterSection(
+            isGroupMentionOnly: policy.type == .group && policy.groupTrigger == .mentionOnly,
+            triggerKeywords: policy.triggerKeywords,
+            ignoreKeywords: policy.ignoreKeywords,
+            onUpdateTriggers: { items in sessions.updatePolicy(conversationId) { $0.triggerKeywords = items } },
+            onUpdateIgnores: { items in sessions.updatePolicy(conversationId) { $0.ignoreKeywords = items } }
+        )
     }
 
     // 能力未就绪时开关仍可保存：引擎在发信时按实际能力回退为普通文本，不会因此失败。
@@ -765,6 +776,84 @@ private struct CooldownResumeControl: View {
 }
 
 // MARK: - 草稿一键发送
+
+private struct KeywordFilterSection: View {
+    let isGroupMentionOnly: Bool
+    let triggerKeywords: [String]
+    let ignoreKeywords: [String]
+    let onUpdateTriggers: ([String]) -> Void
+    let onUpdateIgnores: ([String]) -> Void
+
+    @State private var triggerText: String
+    @State private var ignoreText: String
+
+    init(isGroupMentionOnly: Bool, triggerKeywords: [String], ignoreKeywords: [String],
+         onUpdateTriggers: @escaping ([String]) -> Void, onUpdateIgnores: @escaping ([String]) -> Void) {
+        self.isGroupMentionOnly = isGroupMentionOnly
+        self.triggerKeywords = triggerKeywords
+        self.ignoreKeywords = ignoreKeywords
+        self.onUpdateTriggers = onUpdateTriggers
+        self.onUpdateIgnores = onUpdateIgnores
+        _triggerText = State(initialValue: ConversationPolicy.formatKeywords(triggerKeywords))
+        _ignoreText = State(initialValue: ConversationPolicy.formatKeywords(ignoreKeywords))
+    }
+
+    var body: some View {
+        let total = triggerKeywords.count + ignoreKeywords.count
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("触发白名单词（可选）").font(.callout)
+                    Spacer()
+                    if !triggerKeywords.isEmpty { StatusPill(text: "\(triggerKeywords.count) 项", tone: .active) }
+                }
+                TextField("用逗号分隔，例如：项目进度，报错，接口文档", text: $triggerText)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("conversation-trigger-keywords")
+                    .onChange(of: triggerText) { raw in
+                        let parsed = ConversationPolicy.parseKeywords(raw)
+                        if parsed != triggerKeywords { onUpdateTriggers(parsed) }
+                    }
+                    .onChange(of: triggerKeywords) { latest in
+                        if ConversationPolicy.parseKeywords(triggerText) != latest {
+                            triggerText = ConversationPolicy.formatKeywords(latest)
+                        }
+                    }
+                Text(isGroupMentionOnly
+                     ? "留空仅在被 @ 时触发；填写后，群内被 @ 或消息包含任一触发词均可触发（不绕过风控与叫停锁）。"
+                     : "留空保持默认；填写后仅在消息包含任一触发词时才回复或拟稿（不绕过风控与叫停锁）。")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("忽略黑名单词（可选）").font(.callout)
+                    Spacer()
+                    if !ignoreKeywords.isEmpty { StatusPill(text: "\(ignoreKeywords.count) 项", tone: .warning) }
+                }
+                TextField("用逗号分隔，例如：收到，+1，打卡", text: $ignoreText)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("conversation-ignore-keywords")
+                    .onChange(of: ignoreText) { raw in
+                        let parsed = ConversationPolicy.parseKeywords(raw)
+                        if parsed != ignoreKeywords { onUpdateIgnores(parsed) }
+                    }
+                    .onChange(of: ignoreKeywords) { latest in
+                        if ConversationPolicy.parseKeywords(ignoreText) != latest {
+                            ignoreText = ConversationPolicy.formatKeywords(latest)
+                        }
+                    }
+                Text("消息包含任一忽略词时直接跳过本轮、不调用模型；对方叫停锁仍优先生效。")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Text("关键词触发与忽略")
+                if total > 0 { StatusPill(text: "已配 \(total) 项", tone: .active) }
+            }
+        }
+        .accessibilityIdentifier("conversation-keyword-filters")
+    }
+}
 
 private struct DraftSendControl: View {
     @ObservedObject var workspace: V2Workspace
