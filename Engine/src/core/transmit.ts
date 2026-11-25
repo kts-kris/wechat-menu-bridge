@@ -19,6 +19,7 @@ export type TransmitRequest = {
   pluginDailyLimit?: number;
   messageRef?: string;
   mentionUserIds?: string[];
+  onTiming?: (timing: { fenceMs: number; wireMs: number }) => void;
 };
 type Options = {
   accountId: string; mcpUrl: string; journal: JournalV2; createWriter: () => XiaoheClient | Promise<XiaoheClient>;
@@ -84,6 +85,8 @@ export class TransmitService {
     if (sourceKind !== 'plugin' && (!fenceCursor || fenceCursor.scope.account_id !== accountId ||
         (fenceCursor.scope.conversation_id !== undefined && fenceCursor.scope.conversation_id !== conversationId) ||
         fenceCursor.route !== routeKey(mcpUrl, accountId, fenceCursor.scope.conversation_id))) throw new BridgeError('send-fence');
+    const fenceStarted = performance.now();
+    let wireStarted: number | undefined;
     const writer = await createWriter();
     let reserved = false, onWire = false;
     let release!: () => void;
@@ -115,6 +118,7 @@ export class TransmitService {
         checkStillValid();
         this.writing.set(peer, new Promise<void>(resolve => { release = resolve; }));
         onWire = true;
+        wireStarted = performance.now();
         queueMicrotask(() => {
           try { req.onWire?.(); } catch { /* 状态观察者不参与发信结果判定 */ }
           this.options.onInFlight?.();
@@ -122,6 +126,10 @@ export class TransmitService {
       };
       const receipt = req.messageRef ? await writer.reply(scope, req.messageRef, req.text, attemptId, gate, req.mentionUserIds) :
         await writer.sendText(scope, req.text, attemptId, gate, req.mentionUserIds);
+      const finished = performance.now();
+      const fenceMs = Math.max(0, Math.round((wireStarted ?? finished) - fenceStarted));
+      const wireMs = wireStarted !== undefined ? Math.max(0, Math.round(finished - wireStarted)) : 0;
+      try { req.onTiming?.({ fenceMs, wireMs }); } catch { /* 性能埋点不参与发信结果判定 */ }
       if (!reserved) throw new BridgeError('send-not-authorized');
       journal.complete(attemptId, receipt);
       if (receipt.status === 'unknown') throw new BridgeError('send-unknown');

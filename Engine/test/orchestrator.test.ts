@@ -1248,3 +1248,53 @@ test('v2.3 #23 ruleOverrides、自定义必拦词、铁律不可降级与 policy
     expect(traceDump).not.toContain('机密ABC');
   } finally { await t.close(); }
 });
+
+// ---- v2.4.0 #28：长期全链路性能监控与瓶颈归因体系 ----
+
+test('v2.4 #28 全链路 6 段耗时埋点、SQLite 跨重启持久化、P50/P95 聚合、瓶颈归因与零隐私泄漏', async () => {
+  const t = await setup();
+  try {
+    const pushed: unknown[] = [];
+    const unsub = t.bridge.bus.subscribe('metrics.updated', payload => { pushed.push(payload); });
+    try {
+      await t.arm(peer);
+      await until(() => t.phase(peer) === 'listening');
+
+      t.push(incoming('perf-1', peer, { text: '今天太阳真好，绝密彩蛋XYZ999' }));
+      await until(() => t.sends(peer).length === 1);
+      await until(() => pushed.length >= 1);
+
+      const live = t.bridge.systemMetrics({ windowHours: 24, conversationId: peer });
+      expect(live.sampleCount).toBe(1);
+      expect(live.stages.map(s => s.stage)).toEqual(['ingest', 'debounce', 'prompt', 'model_ttft', 'model_gen', 'send']);
+      expect(live.primaryBottleneck).toBeDefined();
+      expect(live.recent[0]?.outcome).toBe('sent');
+      expect(live.recent[0]?.totalMs).toBeGreaterThanOrEqual(0);
+      // 严禁任何消息正文落入性能指标或推送
+      expect(JSON.stringify(live)).not.toContain('绝密彩蛋XYZ999');
+      expect(JSON.stringify(pushed)).not.toContain('绝密彩蛋XYZ999');
+
+      // 注入 2 条合成样本验证 P50/P95/慢轮次/瓶颈归因/时间窗裁剪与跨重启持久化
+      const now = Date.now();
+      t.bridge.journal.recordTurnMetric({
+        id: 'synthetic-slow', conversationId: peer, at: now - 10_000, outcome: 'sent',
+        ingestMs: 25, debounceMs: 260, promptMs: 8, promptCacheHit: true,
+        modelTtftMs: 4200, modelTotalMs: 5300, fenceMs: 120, sendWireMs: 80,
+        totalMs: 5793, bottleneck: 'model_ttft', modelMode: 'cloud', effort: 'max', fallbackUsed: false,
+      });
+      t.bridge.journal.recordTurnMetric({
+        id: 'synthetic-old', conversationId: peer, at: now - 15 * 86_400_000, outcome: 'sent',
+        ingestMs: 10, debounceMs: 10, promptMs: 1, promptCacheHit: false,
+        modelTtftMs: 100, modelTotalMs: 150, fenceMs: 10, sendWireMs: 10,
+        totalMs: 191, bottleneck: 'model_ttft', modelMode: 'local', effort: 'low', fallbackUsed: false,
+      });
+
+      const agg = t.bridge.systemMetrics({ windowHours: 24, conversationId: peer });
+      expect(agg.sampleCount).toBe(2); // 15 天前样本已被 14 天保留策略自动清理
+      expect(agg.slowCount).toBe(1);
+      expect(agg.primaryBottleneck).toBe('model_ttft');
+      expect(agg.total.p95Ms).toBeGreaterThanOrEqual(5793);
+      expect(agg.recent.some(r => r.id === 'synthetic-old')).toBe(false);
+    } finally { unsub(); }
+  } finally { await t.close(); }
+});

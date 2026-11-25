@@ -18,6 +18,8 @@ private enum Golden {
     static let hello = #"{"capabilities":\#(capabilities),"globalPhase":"running","pendingProposalCount":2,"plugins":{"p1":\#(pluginState)},"sessions":{"wxid_a":\#(session)},"unreadFeedCount":3,"v":3}"#
     static let declarative = #"{"description":"群摘要","enabled":true,"builtinTemplate":"group-digest","id":"p2","name":"摘要","processor":{"maxInputChars":24000,"outputFormat":"structured_digest_json","skipWhenNoValue":true,"systemPrompt":"s","userPromptTemplate":"u"},"rateLimit":{"maxRunsPerHour":4,"maxWeChatSendsPerDay":20},"scope":{"conversationIds":["g@chatroom"],"excludeSelf":true,"includeTypes":["group"],"kinds":["text","recall"]},"sinks":[{"id":"s1","notifyDesktop":true,"type":"app_feed"},{"filenameTemplate":"{{date}}.md","id":"s2","mode":"append","type":"markdown_file"},{"approved":false,"id":"s3","targetConversationId":"filehelper","type":"wechat"},{"hasSecret":true,"id":"s4","type":"webhook","url":"https://hooks.example.invalid/x"},{"hasSecret":false,"id":"s5","platform":"feishu","type":"webhook","url":"https://open.feishu.cn/open-apis/bot/v2/hook/x"}],"trigger":{"everyMinutes":60,"minMessages":5,"timesOfDay":["09:30"],"type":"window_time"}}"#
     static let trace = #"{"at":80,"conversationId":"wxid_a","detail":"对方连发 3 条","id":"trace-1","level":"warn","stage":"policy","summary":"跳过本轮"}"#
+    static let metricSample = #"{"at":85,"bottleneck":"model_ttft","conversationId":"wxid_a","debounceMs":260,"effort":"low","fallbackUsed":false,"fenceMs":45,"id":"m-1","ingestMs":30,"modelMode":"cloud","modelTotalMs":1450,"modelTtftMs":920,"outcome":"sent","promptCacheHit":true,"promptMs":2,"sendWireMs":65,"totalMs":1852}"#
+    static let systemMetrics = #"{"primaryBottleneck":"model_ttft","promptCacheHitCount":1,"recent":[\#(metricSample)],"sampleCount":1,"slowCount":0,"slowThresholdMs":5000,"stages":[{"avgMs":30,"bottleneckCount":0,"p50Ms":30,"p95Ms":30,"sharePercent":2,"stage":"ingest"},{"avgMs":260,"bottleneckCount":0,"p50Ms":260,"p95Ms":260,"sharePercent":14,"stage":"debounce"},{"avgMs":2,"bottleneckCount":0,"p50Ms":2,"p95Ms":2,"sharePercent":0,"stage":"prompt"},{"avgMs":920,"bottleneckCount":1,"p50Ms":920,"p95Ms":920,"sharePercent":50,"stage":"model_ttft"},{"avgMs":530,"bottleneckCount":0,"p50Ms":530,"p95Ms":530,"sharePercent":29,"stage":"model_gen"},{"avgMs":110,"bottleneckCount":0,"p50Ms":110,"p95Ms":110,"sharePercent":6,"stage":"send"}],"total":{"avgMs":1852,"maxMs":1852,"p50Ms":1852,"p95Ms":1852},"windowHours":24}"#
     static let healthCheck = #"{"ok":false,"steps":[{"detail":"已连接","durationMs":12,"id":"xiaohe","label":"小禾连接","ok":true},{"detail":"在白名单内","durationMs":3,"id":"whitelist","label":"发信白名单","ok":true},{"detail":"已读取","durationMs":5,"id":"credentials","label":"本机凭据读取","ok":true},{"detail":"模型返回格式错误","durationMs":4200,"id":"model","label":"云端模型实测","ok":false}]}"#
     static let manifest = #"{"entry":"index.ts","id":"p1","name":"代码插件","permissions":["read_events","call_model","send_wechat"],"version":"1.0.0"}"#
 
@@ -30,6 +32,7 @@ private enum Golden {
         .proposalUpdated: frame("proposal.updated", #"{"latestProposal":\#(proposal),"pendingCount":1}"#),
         .backfillProgress: frame("backfill.progress", #"{"conversationId":"wxid_a","done":false,"error":"mcp-offline","fetched":7,"jobId":"job-1"}"#),
         .sessionTrace: frame("session.trace", #"{"entry":\#(trace)}"#),
+        .metricsUpdated: frame("metrics.updated", #"{"sample":\#(metricSample)}"#),
     ]
 
     static func frame(_ topic: String, _ payload: String) -> String {
@@ -43,7 +46,7 @@ private enum Golden {
     static let policyEvaluate = #"{"finalAction":"draft_only","matchedRule":"schedule","steps":[{"detail":"未命中退订锁或人身安全铁律","outcome":"pass","stage":"iron_rule","title":"① 安全铁律"},{"detail":"当前不在勿扰时段","outcome":"pass","stage":"quiet_hours","title":"② 勿扰时段"},{"detail":"通过关键词门禁","outcome":"pass","stage":"keywords","title":"③ 触发与忽略词"},{"detail":"入站规则：时间或见面约定 → 仅生成草稿（不自动发送）","outcome":"hit","stage":"risk_rules","title":"④ 内置与自定义风控"},{"detail":"仅生成草稿（不自动发送）","outcome":"hit","stage":"verdict","title":"⑤ 最终判定"}]}"#
 
     static let results: [RPCMethod: String] = [
-        .systemStatus: status, .systemPauseAll: "true", .systemHealthCheck: healthCheck, .systemBundles: hotBundles,
+        .systemStatus: status, .systemMetrics: systemMetrics, .systemPauseAll: "true", .systemHealthCheck: healthCheck, .systemBundles: hotBundles,
         .xiaoheAccounts: #"[{"canRead":true,"canSend":true,"id":"acct","label":"账号","sendConversations":["wxid_a"]}]"#,
         .xiaoheConversations: #"{"items":[{"conversationId":"g@chatroom","displayName":"群","isSticky":true,"nickname":"n","remark":"r","type":"group"}],"nextCursor":null,"syncStatus":"ready"}"#,
         .xiaoheGroupMembers: #"[{"displayName":"甲","userId":"u1"}]"#,
@@ -198,7 +201,7 @@ final class V2ClientTests: XCTestCase {
 
     func testAllPushTopicsRoundTripGoldenFrames() throws {
         XCTAssertEqual(Set(Golden.pushes.keys), Set(PushTopic.allCases))
-        XCTAssertEqual(PushTopic.allCases.count, 8)
+        XCTAssertEqual(PushTopic.allCases.count, 9)
         for (topic, json) in Golden.pushes {
             let data = Data(json.utf8)
             let event = try IPCv3.decodeStrict(PushEvent.self, from: data)
@@ -208,7 +211,7 @@ final class V2ClientTests: XCTestCase {
     }
 
     func testAllRPCResultsRoundTripGoldenReplies() throws {
-        XCTAssertEqual(RPCMethod.allCases.count, 37)
+        XCTAssertEqual(RPCMethod.allCases.count, 38)
         XCTAssertEqual(Set(Golden.results.keys), Set(RPCMethod.allCases))
         func check<T: Codable>(_ method: RPCMethod, _ type: T.Type) throws {
             let json = Data(try XCTUnwrap(Golden.results[method]).utf8)
@@ -216,6 +219,7 @@ final class V2ClientTests: XCTestCase {
             XCTAssertTrue(try jsonEqual(IPCv3.encoder().encode(value), json), method.rawValue)
         }
         try check(.systemStatus, SystemStatus.self)
+        try check(.systemMetrics, SystemMetricsResult.self)
         try check(.xiaoheAccounts, [XiaoheAccountOption].self)
         try check(.xiaoheConversations, XiaoheConversationPage.self)
         try check(.xiaoheGroupMembers, [GroupMember].self)
@@ -555,6 +559,7 @@ final class V2ClientTests: XCTestCase {
         settings.conversations["g@chatroom"] = groupPolicy
 
         _ = try await c.systemStatus()
+        _ = try await c.systemMetrics(.init(windowHours: 24, conversationId: "wxid_a", recentLimit: 20))
         _ = try await c.systemHealthCheck(presetId: "m2", conversationId: "wxid_a")
         _ = try await c.systemBundles(action: .status)
         _ = try await c.systemBundles(action: .reload)
@@ -668,8 +673,8 @@ final class V2ClientTests: XCTestCase {
         struct Report: Decodable { let failures: [String]; let requests: Int; let replies: Int; let pushes: Int }
         let report = try JSONDecoder().decode(Report.self, from: output)
         XCTAssertEqual(report.failures, [])
-        XCTAssertGreaterThanOrEqual(report.requests, 35)
-        XCTAssertEqual(report.pushes, 8)
+        XCTAssertGreaterThanOrEqual(report.requests, 38)
+        XCTAssertEqual(report.pushes, 9)
     }
 
     // MARK: BridgeClientV3

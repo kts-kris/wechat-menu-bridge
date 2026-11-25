@@ -4,8 +4,9 @@ import { join } from 'node:path';
 import { dayStart, sha, tomorrow } from '../../contracts.ts';
 import type { Timing } from '../../journal.ts';
 import type { Receipt } from '../../mcp.ts';
-import { BridgeError, type ErrorCode } from '../contracts/errors.ts';
+import { BridgeError, isErrorCode, type ErrorCode } from '../contracts/errors.ts';
 import type { MessageKind } from '../contracts/events.ts';
+import type { PerfStage, PerfStageSummary, SystemMetricsResult, TurnPerfSample } from '../contracts/ipc.ts';
 import type { PluginPermission } from '../contracts/plugins.ts';
 import { assertPrivateFile, ensurePrivateDir } from './fs-safe.ts';
 import { migrateJournalToV2 } from './migrations.ts';
@@ -53,6 +54,66 @@ export type MemoryWatermark = {
 };
 
 const DAY = 86_400_000;
+export const SLOW_TURN_THRESHOLD_MS = 5000;
+const METRIC_RETENTION_DAYS = 14;
+const METRIC_MAX_ROWS = 2000;
+const PERF_STAGES: readonly PerfStage[] = ['ingest', 'debounce', 'prompt', 'model_ttft', 'model_gen', 'send'];
+
+export function classifyTurnBottleneck(sample: {
+  ingestMs: number; debounceMs: number; promptMs: number;
+  modelTtftMs: number; modelTotalMs: number; fenceMs: number; sendWireMs: number;
+}): PerfStage {
+  const durations: [PerfStage, number][] = [
+    ['ingest', Math.max(0, sample.ingestMs)],
+    ['debounce', Math.max(0, sample.debounceMs)],
+    ['prompt', Math.max(0, sample.promptMs)],
+    ['model_ttft', Math.max(0, sample.modelTtftMs)],
+    ['model_gen', Math.max(0, sample.modelTotalMs - sample.modelTtftMs)],
+    ['send', Math.max(0, sample.fenceMs) + Math.max(0, sample.sendWireMs)],
+  ];
+  let best: PerfStage = 'model_ttft';
+  let bestMs = -1;
+  for (const [stage, ms] of durations) {
+    if (ms > bestMs) { best = stage; bestMs = ms; }
+  }
+  return best;
+}
+
+type StoredTurnMetric = {
+  id: string; conversation_id: string; at: number; outcome: TurnPerfSample['outcome'];
+  ingest_ms: number; debounce_ms: number; prompt_ms: number; prompt_cache_hit: 0 | 1;
+  model_ttft_ms: number; model_total_ms: number; fence_ms: number; send_wire_ms: number;
+  total_ms: number; bottleneck: PerfStage; model_mode: 'local' | 'cloud' | null;
+  effort: 'default' | 'low' | 'medium' | 'high' | 'max' | null; fallback_used: 0 | 1; error_code: string | null;
+};
+
+function toTurnMetricSample(row: StoredTurnMetric): TurnPerfSample {
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    at: row.at,
+    outcome: row.outcome,
+    ingestMs: Math.max(0, row.ingest_ms),
+    debounceMs: Math.max(0, row.debounce_ms),
+    promptMs: Math.max(0, row.prompt_ms),
+    promptCacheHit: row.prompt_cache_hit === 1,
+    modelTtftMs: Math.max(0, row.model_ttft_ms),
+    modelTotalMs: Math.max(0, row.model_total_ms),
+    fenceMs: Math.max(0, row.fence_ms),
+    sendWireMs: Math.max(0, row.send_wire_ms),
+    totalMs: Math.max(0, row.total_ms),
+    bottleneck: row.bottleneck,
+    ...(row.model_mode && { modelMode: row.model_mode }),
+    ...(row.effort && { effort: row.effort }),
+    fallbackUsed: row.fallback_used === 1,
+    ...(row.error_code && isErrorCode(row.error_code) && { errorCode: row.error_code }),
+  };
+}
+
+function percentile(sorted: readonly number[], p: number): number {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * p) - 1))] ?? 0;
+}
 
 export class JournalV2 {
   private readonly db: Database;
@@ -78,6 +139,8 @@ export class JournalV2 {
         this.db.run("DELETE FROM attempts WHERE at < ? AND (status <> 'unknown' OR acknowledged=1)", [now - 30 * DAY]);
         this.db.run('DELETE FROM plugin_runs WHERE rowid IN (SELECT rowid FROM plugin_runs ORDER BY started_at DESC, rowid DESC LIMIT -1 OFFSET 500)');
         this.db.run('DELETE FROM feed_items WHERE rowid IN (SELECT rowid FROM feed_items ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET 200)');
+        this.db.run('DELETE FROM turn_metrics WHERE at < ?', [now - METRIC_RETENTION_DAYS * DAY]);
+        this.db.run('DELETE FROM turn_metrics WHERE rowid IN (SELECT rowid FROM turn_metrics ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?)', [METRIC_MAX_ROWS]);
       }).immediate();
     } catch (error) {
       db?.close();
@@ -200,6 +263,115 @@ export class JournalV2 {
     };
     return rows.length ? { count: rows.length, ingest: quantiles('ingest'), batch: quantiles('batch'), model: quantiles('model'),
       rpc: quantiles('rpc'), total: quantiles('total') } : undefined;
+  }
+
+  recordTurnMetric(sample: TurnPerfSample) {
+    this.db.transaction(() => {
+      this.db.query(`INSERT OR REPLACE INTO turn_metrics(
+        id,conversation_id,at,outcome,ingest_ms,debounce_ms,prompt_ms,prompt_cache_hit,
+        model_ttft_ms,model_total_ms,fence_ms,send_wire_ms,total_ms,bottleneck,
+        model_mode,effort,fallback_used,error_code)
+        VALUES($id,$conversation_id,$at,$outcome,$ingest_ms,$debounce_ms,$prompt_ms,$prompt_cache_hit,
+        $model_ttft_ms,$model_total_ms,$fence_ms,$send_wire_ms,$total_ms,$bottleneck,
+        $model_mode,$effort,$fallback_used,$error_code)`).run({
+        id: sample.id,
+        conversation_id: sample.conversationId,
+        at: sample.at,
+        outcome: sample.outcome,
+        ingest_ms: Math.max(0, Math.round(sample.ingestMs)),
+        debounce_ms: Math.max(0, Math.round(sample.debounceMs)),
+        prompt_ms: Math.max(0, Math.round(sample.promptMs)),
+        prompt_cache_hit: sample.promptCacheHit ? 1 : 0,
+        model_ttft_ms: Math.max(0, Math.round(sample.modelTtftMs)),
+        model_total_ms: Math.max(0, Math.round(sample.modelTotalMs)),
+        fence_ms: Math.max(0, Math.round(sample.fenceMs)),
+        send_wire_ms: Math.max(0, Math.round(sample.sendWireMs)),
+        total_ms: Math.max(0, Math.round(sample.totalMs)),
+        bottleneck: sample.bottleneck,
+        model_mode: sample.modelMode ?? null,
+        effort: sample.effort ?? null,
+        fallback_used: sample.fallbackUsed ? 1 : 0,
+        error_code: sample.errorCode ?? null,
+      });
+      this.db.run('DELETE FROM turn_metrics WHERE at < ?', [sample.at - METRIC_RETENTION_DAYS * DAY]);
+      this.db.run('DELETE FROM turn_metrics WHERE rowid IN (SELECT rowid FROM turn_metrics ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?)', [METRIC_MAX_ROWS]);
+    }).immediate();
+  }
+
+  queryTurnMetrics(options: {
+    windowHours?: number; conversationId?: string; recentLimit?: number;
+    slowThresholdMs?: number; nowMs?: number;
+  } = {}): SystemMetricsResult {
+    const windowHours = Math.min(336, Math.max(1, Math.round(options.windowHours ?? 24)));
+    const recentLimit = Math.min(50, Math.max(1, Math.round(options.recentLimit ?? 20)));
+    const slowThresholdMs = options.slowThresholdMs ?? SLOW_TURN_THRESHOLD_MS;
+    const cutoff = (options.nowMs ?? Date.now()) - windowHours * 3_600_000;
+    const rows = options.conversationId
+      ? this.db.query<StoredTurnMetric, [number, string]>(
+        'SELECT * FROM turn_metrics WHERE at >= ? AND conversation_id = ? ORDER BY at DESC, rowid DESC').all(cutoff, options.conversationId)
+      : this.db.query<StoredTurnMetric, [number]>(
+        'SELECT * FROM turn_metrics WHERE at >= ? ORDER BY at DESC, rowid DESC').all(cutoff);
+    const samples = rows.map(toTurnMetricSample);
+    const totals = samples.map(s => s.totalMs).sort((a, b) => a - b);
+    const totalSum = totals.reduce((a, b) => a + b, 0);
+
+    const stageValue = (s: TurnPerfSample, stage: PerfStage): number => {
+      switch (stage) {
+        case 'ingest': return s.ingestMs;
+        case 'debounce': return s.debounceMs;
+        case 'prompt': return s.promptMs;
+        case 'model_ttft': return s.modelTtftMs;
+        case 'model_gen': return Math.max(0, s.modelTotalMs - s.modelTtftMs);
+        case 'send': return s.fenceMs + s.sendWireMs;
+      }
+    };
+
+    const avgByStage = new Map<PerfStage, number>();
+    let avgStageSum = 0;
+    for (const stage of PERF_STAGES) {
+      const sum = samples.reduce((acc, s) => acc + stageValue(s, stage), 0);
+      const avg = samples.length ? Math.round(sum / samples.length) : 0;
+      avgByStage.set(stage, avg);
+      avgStageSum += avg;
+    }
+
+    const stages: PerfStageSummary[] = PERF_STAGES.map(stage => {
+      const values = samples.map(s => stageValue(s, stage)).sort((a, b) => a - b);
+      const avgMs = avgByStage.get(stage) ?? 0;
+      return {
+        stage,
+        p50Ms: percentile(values, 0.5),
+        p95Ms: percentile(values, 0.95),
+        avgMs,
+        sharePercent: avgStageSum > 0 ? Math.min(100, Math.round((avgMs / avgStageSum) * 100)) : 0,
+        bottleneckCount: samples.filter(s => s.bottleneck === stage).length,
+      };
+    });
+
+    let primaryBottleneck: PerfStage | undefined;
+    if (samples.length > 0) {
+      let bestAvg = -1;
+      for (const item of stages) {
+        if (item.avgMs > bestAvg) { bestAvg = item.avgMs; primaryBottleneck = item.stage; }
+      }
+    }
+
+    return {
+      windowHours,
+      sampleCount: samples.length,
+      slowCount: samples.filter(s => s.totalMs >= slowThresholdMs).length,
+      slowThresholdMs,
+      promptCacheHitCount: samples.filter(s => s.promptCacheHit).length,
+      total: {
+        p50Ms: percentile(totals, 0.5),
+        p95Ms: percentile(totals, 0.95),
+        maxMs: totals.at(-1) ?? 0,
+        avgMs: samples.length ? Math.round(totalSum / samples.length) : 0,
+      },
+      ...(primaryBottleneck && { primaryBottleneck }),
+      stages,
+      recent: samples.slice(0, recentLimit),
+    };
   }
 
   savePluginState(state: PluginState) {

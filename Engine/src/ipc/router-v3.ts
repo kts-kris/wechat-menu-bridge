@@ -21,6 +21,7 @@ export class IpcV3Router {
     this.handlers = {
       ...extensions,
       'system.status': () => bridge.status(),
+      'system.metrics': p => bridge.systemMetrics(p),
       'system.healthCheck': p => bridge.healthCheck(p),
       'system.pauseAll': p => bridge.pauseAll(p.scope, p.reason),
       'xiaohe.accounts': p => bridge.accounts(p.mcpUrl),

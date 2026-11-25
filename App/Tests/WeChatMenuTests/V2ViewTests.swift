@@ -30,6 +30,7 @@ private let capabilitiesJSON = #"{"accountWideEvents":true,"canSendText":true,"g
 private let helloFrame = #"{"kind":"event","payload":{"capabilities":\#(capabilitiesJSON),"globalPhase":"running","pendingProposalCount":2,"plugins":{},"sessions":{"wxid_a":{"phase":"blocked-unknown","replyMode":"off","reason":"send-unknown"},"g@chatroom":{"phase":"listening","replyMode":"auto"}},"unreadFeedCount":3,"v":3},"topic":"hello","v":3}"#
 
 private let hotBundlesJSON = #"{"items":[{"name":"policy.json","sha256":"\#(String(repeating: "a", count: 64))","verified":true}],"lastReloadAt":1764000000000,"loadedCount":1,"version":"2026.11.24"}"#
+private let emptyMetricsJSON = #"{"promptCacheHitCount":0,"recent":[],"sampleCount":0,"slowCount":0,"slowThresholdMs":5000,"stages":[{"avgMs":0,"bottleneckCount":0,"p50Ms":0,"p95Ms":0,"sharePercent":0,"stage":"ingest"},{"avgMs":0,"bottleneckCount":0,"p50Ms":0,"p95Ms":0,"sharePercent":0,"stage":"debounce"},{"avgMs":0,"bottleneckCount":0,"p50Ms":0,"p95Ms":0,"sharePercent":0,"stage":"prompt"},{"avgMs":0,"bottleneckCount":0,"p50Ms":0,"p95Ms":0,"sharePercent":0,"stage":"model_ttft"},{"avgMs":0,"bottleneckCount":0,"p50Ms":0,"p95Ms":0,"sharePercent":0,"stage":"model_gen"},{"avgMs":0,"bottleneckCount":0,"p50Ms":0,"p95Ms":0,"sharePercent":0,"stage":"send"}],"total":{"avgMs":0,"maxMs":0,"p50Ms":0,"p95Ms":0},"windowHours":24}"#
 
 private let personaMarkdown = """
 ---
@@ -108,7 +109,8 @@ final class V2ViewTests: XCTestCase {
             let revision = ###"{"createdAt":1764000000000,"diffPreview":\###(diff),"revId":"rev-1","scopeKey":"global","snapshotPath":"/x/rev-1.md","source":"auto","summary":"更新表达风格","targetKind":"persona"}"###
             transport.results = ["feed.list": #"{"items":[],"nextCursor":null}"#, "plugins.list": "[]",
                                  "persona.proposals": #"{"items":[],"nextCursor":null}"#, "xiaohe.accounts": "[]",
-                                 "session.traces": #"{"items":[]}"#, "system.bundles": hotBundlesJSON, "memory.get": "{\"text\":\(document)}",
+                                 "session.traces": #"{"items":[]}"#, "system.bundles": hotBundlesJSON,
+                                 "system.metrics": emptyMetricsJSON, "memory.get": "{\"text\":\(document)}",
                                  "memory.revisions": "{\"items\":[\(revision)],\"nextCursor\":null}"]
             transport.feed(helloFrame)
             XCTAssertTrue(workspace.runtime.ready)
@@ -1860,5 +1862,61 @@ final class V2ViewTests: XCTestCase {
         let dark = try snapshot(view, appearance: .darkAqua, size: size)
         XCTAssertNotEqual(light, dark)
         XCTAssertTrue(workspace.runtime.ready)
+    }
+
+    // MARK: v2.4.0 长期全链路性能监控与瓶颈归因（#28）
+
+    func testPerformanceMonitorCardRendersEmptyNormalSlowAndDiagnosticReport() throws {
+        XCTAssertEqual(PerfStage.allCases.count, 6)
+        XCTAssertEqual(PerfFormat.duration(850), "850ms")
+        XCTAssertEqual(PerfFormat.duration(1852), "1.85s")
+
+        let (workspace, _) = try makeWorkspace(connected: true)
+        seededSettings(workspace)
+        let emptyView = Form { PerformanceMonitorSection(workspace: workspace) }.formStyle(.grouped)
+        let emptyLight = try snapshot(emptyView, appearance: .aqua, size: CGSize(width: 680, height: 320))
+
+        let slowSample = TurnPerfSample(
+            id: "m-slow", conversationId: "wxid_a", at: 1764000000000, outcome: .sent,
+            ingestMs: 40, debounceMs: 260, promptMs: 12, promptCacheHit: true,
+            modelTtftMs: 4200, modelTotalMs: 5300, fenceMs: 180, sendWireMs: 90,
+            totalMs: 5882, bottleneck: .modelTtft, modelMode: .cloud, effort: .max,
+            fallbackUsed: false, errorCode: nil
+        )
+        let populated = SystemMetricsResult(
+            windowHours: 24, sampleCount: 3, slowCount: 1, slowThresholdMs: 5000, promptCacheHitCount: 2,
+            total: .init(p50Ms: 2100, p95Ms: 5882, maxMs: 5882, avgMs: 3100),
+            primaryBottleneck: .modelTtft,
+            stages: [
+                .init(stage: .ingest, p50Ms: 30, p95Ms: 40, avgMs: 32, sharePercent: 1, bottleneckCount: 0),
+                .init(stage: .debounce, p50Ms: 260, p95Ms: 300, avgMs: 270, sharePercent: 9, bottleneckCount: 0),
+                .init(stage: .prompt, p50Ms: 5, p95Ms: 12, avgMs: 6, sharePercent: 0, bottleneckCount: 0),
+                .init(stage: .modelTtft, p50Ms: 1400, p95Ms: 4200, avgMs: 2050, sharePercent: 66, bottleneckCount: 3),
+                .init(stage: .modelGen, p50Ms: 350, p95Ms: 1100, avgMs: 520, sharePercent: 17, bottleneckCount: 0),
+                .init(stage: .send, p50Ms: 160, p95Ms: 270, avgMs: 222, sharePercent: 7, bottleneckCount: 0),
+            ],
+            recent: [slowSample]
+        )
+
+        let filledView = Form {
+            PerformanceMonitorSection(workspace: workspace, overrideMetrics: populated, showRecent: true)
+        }.formStyle(.grouped)
+        let filledLight = try snapshot(filledView, appearance: .aqua, size: CGSize(width: 680, height: 680))
+        let filledDark = try snapshot(filledView, appearance: .darkAqua, size: CGSize(width: 680, height: 680))
+        XCTAssertNotEqual(emptyLight, filledLight)
+        XCTAssertNotEqual(filledLight, filledDark)
+
+        // 诊断报告自动附带脱敏性能画像，绝不携带聊天正文或凭据。
+        var snap = DiagnosticSnapshot.capture(workspace)
+        snap.perfSummary = .init(
+            windowHours: 24, sampleCount: 3, slowCount: 1,
+            p50Ms: 2100, p95Ms: 5882, maxMs: 5882,
+            primaryBottleneck: .modelTtft,
+            stageShares: populated.stages.map { ($0.stage, $0.sharePercent, $0.p50Ms, $0.p95Ms) }
+        )
+        let report = DiagnosticBundleBuilder.buildReport(snapshot: snap, logLines: [])
+        XCTAssertTrue(report.contains("## 性能画像（最近 24 小时，3 轮）"))
+        XCTAssertTrue(report.contains("当前主瓶颈：模型首包 (TTFT)（model_ttft）"))
+        XCTAssertTrue(report.contains("P50 2100ms · P95 5882ms"))
     }
 }
