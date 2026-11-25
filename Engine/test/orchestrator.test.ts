@@ -1109,3 +1109,53 @@ test('v2.3 #21 勿扰时段 skip_turn 跳过不调模型、draft_only 降级仅�
     expect(isInQuietHours(t.bridge.currentSettings.runtime.quietHours, fakeNow)).toBe(false);
   } finally { await t.close(); }
 });
+
+// ---- v2.3.0 #22：会话级关键词触发白名单与忽略黑名单 ----
+
+test('v2.3 #22 忽略词跳过、私聊白名单过滤、群聊被 @ 或命中触发词放行且不绕过叫停与风控', async () => {
+  const t = await setup();
+  try {
+    // 配置私聊白名单+忽略词、群聊 mention_only + 触发词
+    const next = structuredClone(t.bridge.currentSettings);
+    next.conversations[peer]!.triggerKeywords = ['项目进度', 'BUG'];
+    next.conversations[peer]!.ignoreKeywords = ['每日打卡', '+1'];
+    next.conversations[group]!.groupTrigger = 'mention_only';
+    next.conversations[group]!.triggerKeywords = ['上线'];
+    await t.bridge.applySettings(next);
+
+    await t.arm(peer);
+    await t.arm(group);
+    await until(() => t.phase(peer) === 'listening' && t.phase(group) === 'listening');
+
+    // 1. 私聊命中忽略词（即使同时含触发词，忽略词优先跳过且零模型调用、轨迹不记词条或原文）
+    t.push(incoming('kw-ign-1', peer, { text: '每日打卡项目进度，秘密内容XYZ' }));
+    await until(() => t.bridge.sessionTraces({ conversationId: peer, limit: 20 }).items.some(e => e.summary === '命中忽略词，已跳过本轮'));
+    expect(t.models.length).toBe(0);
+    expect(t.sends(peer).length).toBe(0);
+    const serializedTraces = JSON.stringify(t.bridge.sessionTraces({ conversationId: peer, limit: 20 }).items);
+    expect(serializedTraces).not.toContain('每日打卡');
+    expect(serializedTraces).not.toContain('秘密内容XYZ');
+
+    // 2. 私聊未命中触发白名单 → 跳过不调模型
+    t.push(incoming('kw-miss-1', peer, { text: '今天太阳不错' }));
+    await until(() => t.bridge.sessionTraces({ conversationId: peer, limit: 20 }).items.some(e => e.summary === '未命中触发白名单词，已跳过本轮'));
+    expect(t.models.length).toBe(0);
+
+    // 3. 私聊命中白名单（大小写不敏感 'bug' 匹配 'BUG'）→ 正常回复
+    t.push(incoming('kw-hit-1', peer, { text: '看下这个 bug 怎么修' }));
+    await until(() => t.sends(peer).length === 1);
+
+    // 4. 群聊 mention_only 下未 @ 但命中触发词 '上线' → 放行回复
+    t.push(incoming('kw-grp-hit', group, { sender_id: secondPeer, text: '今晚准备上线了' }));
+    await until(() => t.sends(group).length === 1);
+
+    // 5. 群聊 mention_only 下既未 @ 也未命中触发词 → 跳过
+    t.push(incoming('kw-grp-miss', group, { sender_id: secondPeer, text: '大家中午好' }));
+    await until(() => t.bridge.sessionTraces({ conversationId: group, limit: 20 }).items.some(e => e.summary.includes('仅被 @ 或命中触发词时触发')));
+    expect(t.sends(group).length).toBe(1);
+
+    // 6. 安全铁律：即使命中白名单或忽略词，对方叫停仍永久锁定 peer-stopped
+    t.push(incoming('kw-stop-1', peer, { text: '每日打卡，别再自动回复了' }));
+    await until(() => t.phase(peer) === 'locked-opt-out');
+  } finally { await t.close(); }
+});

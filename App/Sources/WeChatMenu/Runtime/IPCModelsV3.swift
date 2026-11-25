@@ -246,26 +246,31 @@ struct ConversationPolicy: Codable, Equatable, Identifiable, Sendable {
     // v2.2.0：优先引用原消息回复；群聊回复时 @ 提问成员。旧 settings.json 缺省为 false。
     var useNativeReply = false
     var mentionReplySender = false
-    // v2.3.0：豁免全局勿扰时段。旧 settings.json 缺省为 false。
+    // v2.3.0：豁免全局勿扰时段；关键词触发白名单与忽略黑名单。旧 settings.json 缺省为 false / []。
     var ignoreQuietHours = false
+    var triggerKeywords: [String] = []
+    var ignoreKeywords: [String] = []
 
     var id: String { conversationId }
 
     private enum CodingKeys: String, CodingKey {
         case conversationId, label, type, enabled, replyMode, replyPresetId, groupTrigger, riskProfile
         case backfillOnArmCount, memoryEnabled, pluginIds, useNativeReply, mentionReplySender, ignoreQuietHours
+        case triggerKeywords, ignoreKeywords
     }
 
     init(conversationId: String, label: String, type: ScopeType, enabled: Bool = false, replyMode: SessionReplyMode = .off,
          replyPresetId: String? = nil, groupTrigger: GroupTrigger = .mentionOnly, riskProfile: RiskProfile = RiskProfile(),
          backfillOnArmCount: Int = 10, memoryEnabled: Bool? = nil, pluginIds: [String] = [],
-         useNativeReply: Bool = false, mentionReplySender: Bool = false, ignoreQuietHours: Bool = false) {
+         useNativeReply: Bool = false, mentionReplySender: Bool = false, ignoreQuietHours: Bool = false,
+         triggerKeywords: [String] = [], ignoreKeywords: [String] = []) {
         self.conversationId = conversationId; self.label = label; self.type = type; self.enabled = enabled
         self.replyMode = replyMode; self.replyPresetId = replyPresetId; self.groupTrigger = groupTrigger
         self.riskProfile = riskProfile; self.backfillOnArmCount = backfillOnArmCount
         self.memoryEnabled = memoryEnabled ?? (type == .direct); self.pluginIds = pluginIds
         self.useNativeReply = useNativeReply; self.mentionReplySender = mentionReplySender
         self.ignoreQuietHours = ignoreQuietHours
+        self.triggerKeywords = triggerKeywords; self.ignoreKeywords = ignoreKeywords
     }
 
     init(from decoder: Decoder) throws {
@@ -283,7 +288,41 @@ struct ConversationPolicy: Codable, Equatable, Identifiable, Sendable {
                   pluginIds: try c.defaulted(.pluginIds, []),
                   useNativeReply: try c.defaulted(.useNativeReply, false),
                   mentionReplySender: try c.defaulted(.mentionReplySender, false),
-                  ignoreQuietHours: try c.defaulted(.ignoreQuietHours, false))
+                  ignoreQuietHours: try c.defaulted(.ignoreQuietHours, false),
+                  triggerKeywords: try c.defaulted(.triggerKeywords, []),
+                  ignoreKeywords: try c.defaulted(.ignoreKeywords, []))
+    }
+
+    static let maxKeywordCount = 64
+    static let maxKeywordLength = 64
+
+    static func isValidKeyword(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= maxKeywordLength else { return false }
+        return !trimmed.unicodeScalars.contains { $0.properties.generalCategory == .control }
+    }
+
+    /// 将用户以逗号、分号或换行分隔的关键词文本解析为去重、受限的词条数组。
+    static func parseKeywords(_ raw: String) -> [String] {
+        let separators = CharacterSet(charactersIn: ",，;；\r\n")
+        var seen = Set<String>()
+        var result: [String] = []
+        for token in raw.components(separatedBy: separators) {
+            let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let clipped = String(trimmed.prefix(maxKeywordLength))
+            guard isValidKeyword(clipped) else { continue }
+            let key = clipped.precomposedStringWithCompatibilityMapping.lowercased()
+            if seen.insert(key).inserted {
+                result.append(clipped)
+                if result.count >= maxKeywordCount { break }
+            }
+        }
+        return result
+    }
+
+    static func formatKeywords(_ items: [String]) -> String {
+        items.joined(separator: "，")
     }
 }
 
@@ -423,7 +462,11 @@ struct SettingsV2: Codable, Equatable, Sendable {
         for (key, policy) in conversations {
             guard key == policy.conversationId, Self.identifier(key), policy.riskProfile.takeoverCooldownMinutes > 0,
                   (0...500).contains(policy.backfillOnArmCount), policy.pluginIds.allSatisfy(Self.identifier),
-                  policy.replyPresetId.map(Self.identifier) ?? true else { throw invalid }
+                  policy.replyPresetId.map(Self.identifier) ?? true,
+                  policy.triggerKeywords.count <= ConversationPolicy.maxKeywordCount,
+                  policy.triggerKeywords.allSatisfy(ConversationPolicy.isValidKeyword),
+                  policy.ignoreKeywords.count <= ConversationPolicy.maxKeywordCount,
+                  policy.ignoreKeywords.allSatisfy(ConversationPolicy.isValidKeyword) else { throw invalid }
         }
         guard (4...64).contains(memory.workingMaxMessages), (3...240).contains(memory.workingTtlMinutes),
               memory.autoConsolidateIdleMinutes > 0, memory.autoConsolidateTurnThreshold > 0,

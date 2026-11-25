@@ -41,6 +41,17 @@ export const quietHoursSchema = z.strictObject({
 });
 export type QuietHoursConfig = z.infer<typeof quietHoursSchema>;
 
+const keywordItemSchema = z.string().trim().min(1).max(64).regex(/^[^\p{Cc}]+$/u);
+const keywordListSchema = z.array(keywordItemSchema).max(64).default([]).transform(items => {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of items) {
+    const key = raw.normalize('NFKC').toLowerCase();
+    if (!seen.has(key)) { seen.add(key); out.push(raw); }
+  }
+  return out;
+});
+
 const riskLevelSchema = z.enum(['recommended', 'strict', 'minimal']);
 const riskProfileSchema = z.strictObject({
   level: riskLevelSchema.optional(),
@@ -66,6 +77,8 @@ export const conversationPolicySchema = z.strictObject({
   useNativeReply: z.boolean().default(false),
   mentionReplySender: z.boolean().default(false),
   ignoreQuietHours: z.boolean().default(false),
+  triggerKeywords: keywordListSchema,
+  ignoreKeywords: keywordListSchema,
 }).transform(policy => ({ ...policy, memoryEnabled: policy.memoryEnabled ?? policy.type === 'direct' }));
 
 export const settingsV2Schema = z.strictObject({

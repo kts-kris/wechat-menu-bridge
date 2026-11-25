@@ -1773,4 +1773,40 @@ final class V2ViewTests: XCTestCase {
             XCTAssertNotEqual(off, on, appearance.rawValue)
         }
     }
+
+    // MARK: v2.3.0 会话关键词过滤（#22）
+
+    func testKeywordParsingValidationAndRendering() throws {
+        XCTAssertEqual(ConversationPolicy.parseKeywords(" 项目进度，BUG, bug ; 打卡\n  "), ["项目进度", "BUG", "打卡"])
+        XCTAssertEqual(ConversationPolicy.formatKeywords(["项目进度", "BUG"]), "项目进度，BUG")
+        let many = (1...80).map { "词\($0)" }.joined(separator: ",")
+        XCTAssertEqual(ConversationPolicy.parseKeywords(many).count, ConversationPolicy.maxKeywordCount)
+
+        var settings = SettingsV2()
+        settings.conversations["wxid_a"] = ConversationPolicy(
+            conversationId: "wxid_a", label: "甲", type: .direct, enabled: true,
+            triggerKeywords: ["项目"], ignoreKeywords: ["收到"]
+        )
+        XCTAssertNoThrow(try settings.validate())
+        let data = try IPCv3.encoder().encode(settings)
+        let roundTripped = try IPCv3.decodeStrict(SettingsV2.self, from: data)
+        XCTAssertEqual(roundTripped.conversations["wxid_a"]?.triggerKeywords, ["项目"])
+        XCTAssertEqual(roundTripped.conversations["wxid_a"]?.ignoreKeywords, ["收到"])
+
+        var bad = settings
+        bad.conversations["wxid_a"]?.ignoreKeywords = ["bad\u{0000}ctrl"]
+        XCTAssertThrowsError(try bad.validate())
+
+        let (workspace, _) = try makeWorkspace(connected: true)
+        seededSettings(workspace)
+        workspace.selectedConversationId = "wxid_a"
+        let size = CGSize(width: ConsoleView.minimumSize.width - 200, height: 1800)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            workspace.settings.draft.conversations["wxid_a"]?.triggerKeywords = []
+            let empty = try snapshot(ConversationsView(workspace: workspace), appearance: appearance, size: size)
+            workspace.settings.draft.conversations["wxid_a"]?.triggerKeywords = ["项目", "接口"]
+            let filled = try snapshot(ConversationsView(workspace: workspace), appearance: appearance, size: size)
+            XCTAssertNotEqual(empty, filled, appearance.rawValue)
+        }
+    }
 }

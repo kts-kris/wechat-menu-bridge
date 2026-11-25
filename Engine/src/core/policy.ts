@@ -19,14 +19,27 @@ export function isInQuietHours(config: QuietHoursConfig | undefined, nowMs: numb
   return start < end ? current >= start && current < end : current >= start || current < end;
 }
 
+/** NFKC + 大小写不敏感子串匹配，用于会话触发白名单与忽略黑名单。 */
+export function matchesKeywordList(text: string, keywords: readonly string[]): boolean {
+  if (!text || !keywords.length) return false;
+  const haystack = text.normalize('NFKC').toLowerCase();
+  for (const raw of keywords) {
+    const needle = raw.trim().normalize('NFKC').toLowerCase();
+    if (needle && haystack.includes(needle)) return true;
+  }
+  return false;
+}
+
 type Action = 'lock_peer' | 'pause_session' | 'cooldown_or_pause' | 'skip_turn' | 'identity' | 'allow';
 type ReviewHit = { source: 'inbound'; rule: TextReviewRule } | { source: 'outbound'; rule: DraftReviewRule } |
   { source: 'model' | 'unparsed-media' | 'unavailable-body' };
+export type KeywordGate = 'ignored' | 'trigger-missed' | 'group-unmentioned';
 export type PolicyDecision = {
   action: Action;
   reason?: 'peer-stopped' | 'manual-review' | 'manual-takeover' | 'busy-chat' | 'model-skip';
   text?: string;
   review?: ReviewHit;
+  keywordGate?: KeywordGate;
 };
 
 const reviewLabels: Record<DraftReviewRule, string> = {
@@ -84,8 +97,22 @@ export class PolicyEngine {
     const level = riskLevel(policy.riskProfile);
     const match = this.inboundMatch(event.text, level);
     if (match?.action === 'stop') return { action: 'lock_peer', reason: 'peer-stopped' };
-    const referenced = event.scopeType !== 'group' || policy.groupTrigger === 'all' || event.mentions.mentionsSelf;
-    if (!referenced) return { action: 'skip_turn' };
+    if (policy.ignoreKeywords.length > 0 && matchesKeywordList(event.text, policy.ignoreKeywords)) {
+      return { action: 'skip_turn', keywordGate: 'ignored' };
+    }
+    const hasTriggers = policy.triggerKeywords.length > 0;
+    const hitTrigger = hasTriggers && matchesKeywordList(event.text, policy.triggerKeywords);
+    if (event.scopeType === 'group') {
+      if (policy.groupTrigger === 'mention_only') {
+        if (!event.mentions.mentionsSelf && !hitTrigger) {
+          return { action: 'skip_turn', keywordGate: 'group-unmentioned' };
+        }
+      } else if (hasTriggers && !hitTrigger) {
+        return { action: 'skip_turn', keywordGate: 'trigger-missed' };
+      }
+    } else if (hasTriggers && !hitTrigger) {
+      return { action: 'skip_turn', keywordGate: 'trigger-missed' };
+    }
     if (match?.action === 'manual') {
       return manualReview(level === 'strict' ? 'pause_session' : 'skip_turn', { source: 'inbound', rule: match.rule });
     }

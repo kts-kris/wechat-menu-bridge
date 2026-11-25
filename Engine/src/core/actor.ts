@@ -83,12 +83,17 @@ export class ConversationActor {
 
   updatePolicy(nextPolicy: ConversationPolicy) {
     const narrowedTrigger = nextPolicy.type === 'group' && this.policy.groupTrigger === 'all' && nextPolicy.groupTrigger === 'mention_only';
+    const changedKeywords = JSON.stringify(this.policy.triggerKeywords) !== JSON.stringify(nextPolicy.triggerKeywords) ||
+      JSON.stringify(this.policy.ignoreKeywords) !== JSON.stringify(nextPolicy.ignoreKeywords);
     const changedLevel = this.riskLevel !== riskLevel(nextPolicy.riskProfile);
     this.policyValue = nextPolicy;
     if (changedLevel) this.window = this.window.filter(event => this.keepsContext(event));
-    if (changedLevel || narrowedTrigger) {
-      // 旧档已排队或拟好的回合不能继续发送；保留授权、锁和正在解析的媒体。
-      const eligible = changedLevel ? [] : this.queue.filter(event => event.mentions.mentionsSelf);
+    if (changedLevel || narrowedTrigger || changedKeywords) {
+      // 旧档或旧关键词门禁下已排队/拟好的回合不能继续发送；保留授权、锁和正在解析的媒体。
+      const eligible = changedLevel ? [] : this.queue.filter(event => {
+        const check = this.engine.inbound(event, nextPolicy, false);
+        return check.action === 'allow' || check.action === 'identity';
+      });
       const removed = eligible.length !== this.queue.length;
       if (removed) this.invalidate();
       this.queue = eligible;
@@ -343,8 +348,13 @@ export class ConversationActor {
     const outcome = this.engine.inbound(event, this.policy, false);
     if (outcome.action === 'skip_turn') {
       if (outcome.reason) this.apply(outcome);
-      else if (event.scopeType === 'group' && this.policy.groupTrigger === 'mention_only' && !event.mentions.mentionsSelf) {
-        this.options.onTrace?.('policy', 'info', '仅被 @ 时触发，未提及本人');
+      else if (outcome.keywordGate === 'ignored') {
+        this.options.onTrace?.('policy', 'info', '命中忽略词，已跳过本轮');
+      } else if (outcome.keywordGate === 'trigger-missed') {
+        this.options.onTrace?.('policy', 'info', '未命中触发白名单词，已跳过本轮');
+      } else if (outcome.keywordGate === 'group-unmentioned') {
+        this.options.onTrace?.('policy', 'info', this.policy.triggerKeywords.length > 0
+          ? '仅被 @ 或命中触发词时触发，已跳过本轮' : '仅被 @ 时触发，未提及本人');
       }
       return;
     }
