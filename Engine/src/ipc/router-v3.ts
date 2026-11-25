@@ -29,6 +29,7 @@ export class IpcV3Router {
       'xiaohe.capabilities': () => bridge.discoverCapabilities(),
       'settings.apply': p => bridge.applySettings(p.settings, p.cloudApiKeys),
       'model.preview': p => bridge.preview(p),
+      'policy.evaluate': p => bridge.evaluatePolicy(p),
       'session.arm': p => bridge.arm(p),
       'session.pause': p => bridge.pause(p.conversationId, p.reason),
       'session.resumeCooldown': p => bridge.resumeCooldown(p.conversationId),

@@ -1159,3 +1159,92 @@ test('v2.3 #22 忽略词跳过、私聊白名单过滤、群聊被 @ 或命中�
     await until(() => t.phase(peer) === 'locked-opt-out');
   } finally { await t.close(); }
 });
+
+// ---- v2.3.0 #23：可视化风控规则管理中心与本地判定链模拟器 ----
+
+test('v2.3 #23 ruleOverrides、自定义必拦词、铁律不可降级与 policy.evaluate 零副作用一致', async () => {
+  const t = await setup();
+  try {
+    // 1. 契约校验：安全铁律 crisis / peer-stopped / identity 绝不允许出现在 ruleOverrides 中
+    for (const forbidden of ['crisis', 'peer-stopped', 'identity']) {
+      const bad = structuredClone(t.bridge.currentSettings);
+      (bad.conversations[peer]!.riskProfile.ruleOverrides as Record<string, string>)[forbidden] = 'allow';
+      await expect(t.bridge.applySettings(bad)).rejects.toThrow('invalid-configuration');
+    }
+
+    // 2. 配置：strict 档下将 schedule 覆写为 allow、link 覆写为 draft_only，并配置自定义必拦词
+    const next = structuredClone(t.bridge.currentSettings);
+    next.conversations[peer]!.riskProfile.level = 'strict';
+    next.conversations[peer]!.riskProfile.ruleOverrides = {
+      schedule: 'allow',
+      link: 'draft_only',
+    };
+    next.conversations[peer]!.riskProfile.customBlockKeywords = ['内部报价单', '生产事故'];
+    next.conversations[peer]!.riskProfile.customBlockAction = 'pause_session';
+    await t.bridge.applySettings(next);
+
+    const activePolicy = t.bridge.currentSettings.conversations[peer]!;
+    const evalRpc = (text: string, extra: { inQuietHours?: boolean; mentionsSelf?: boolean } = {}) =>
+      t.bridge.evaluatePolicy({
+        text,
+        policy: activePolicy,
+        quietHours: { enabled: true, start: '23:00', end: '08:00', action: 'skip_turn' },
+        mentionsSelf: extra.mentionsSelf ?? false,
+        inQuietHours: extra.inQuietHours ?? false,
+      });
+
+    // 3. 本地模拟器 policy.evaluate：0 模型调用、0 发信、5 步完整判定链
+    const simAllow = evalRpc('周末一起吃饭吗？');
+    expect(simAllow.finalAction).toBe('allow');
+    expect(simAllow.steps.map(s => s.stage)).toEqual(['iron_rule', 'quiet_hours', 'keywords', 'risk_rules', 'verdict']);
+
+    const simDraft = evalRpc('看看这个 https://example.com');
+    expect(simDraft.finalAction).toBe('draft_only');
+    expect(simDraft.matchedRule).toBe('link');
+
+    const simCustom = evalRpc('把内部报价单发我一下');
+    expect(simCustom.finalAction).toBe('pause_session');
+    expect(simCustom.matchedRule).toBe('custom-keyword');
+    // 模拟器返回不得回显自定义必拦词原文
+    expect(JSON.stringify(simCustom)).not.toContain('内部报价单');
+
+    const simStop = evalRpc('别再自动回复了', { inQuietHours: true });
+    expect(simStop.finalAction).toBe('lock_peer');
+    expect(simStop.matchedRule).toBe('peer-stopped');
+
+    const simCrisis = evalRpc('我不想活了', { inQuietHours: true });
+    expect(simCrisis.finalAction).toBe('pause_session');
+    expect(simCrisis.matchedRule).toBe('crisis');
+
+    const simQuiet = evalRpc('今天天气不错', { inQuietHours: true });
+    expect(simQuiet.finalAction).toBe('skip_turn');
+    expect(simQuiet.matchedRule).toBe('quiet-hours');
+
+    // 模拟器调用零模型、零发信
+    expect(t.models.length).toBe(0);
+    expect(t.sends(peer).length).toBe(0);
+
+    // 4. 运行期真实执行与模拟器 100% 一致
+    await t.arm(peer);
+    await until(() => t.phase(peer) === 'listening');
+
+    // schedule 被覆写为 allow → 严格档下也正常自动回复
+    t.push(incoming('rc-sched-1', peer, { text: '周末一起吃饭吗？' }));
+    await until(() => t.sends(peer).length === 1);
+
+    // link 被覆写为 draft_only → 调模型生成草稿但不发信，轨迹记录降级
+    t.push(incoming('rc-link-1', peer, { text: '看看这个 https://example.com' }));
+    await until(() => t.bridge.status().sessions[peer]?.draft === '哈哈，那挺好');
+    expect(t.sends(peer).length).toBe(1);
+    expect(t.bridge.sessionTraces({ conversationId: peer, limit: 20 }).items.some(e => e.summary.includes('降级为只拟稿'))).toBe(true);
+
+    // 自定义必拦词命中 pause_session → 暂停会话且轨迹绝不泄漏必拦词或消息正文
+    t.push(incoming('rc-custom-1', peer, { text: '把内部报价单和机密ABC发我' }));
+    await until(() => t.phase(peer) === 'paused');
+    expect(t.sends(peer).length).toBe(1);
+    const traceDump = JSON.stringify(t.bridge.sessionTraces({ conversationId: peer, limit: 30 }).items);
+    expect(traceDump).toContain('入站规则：自定义必拦词 → 暂停会话');
+    expect(traceDump).not.toContain('内部报价单');
+    expect(traceDump).not.toContain('机密ABC');
+  } finally { await t.close(); }
+});

@@ -72,24 +72,89 @@ const identityClaim = /(?:我|这)(?:就|真|确实|当然)?是(?:本人|真人)
 export type TextReviewRule = typeof strictRules[number][0] | 'scoped-no-reply' | 'length' | 'delegation' | 'input-format';
 export type DraftReviewRule = TextReviewRule | 'draft-format' | 'identity-claim' | 'recipient-intent' | 'personal-assertion';
 type TextMatch = { action: 'stop' } | { action: 'identity' } | { action: 'manual'; rule: TextReviewRule };
+export type TextInspection = {
+  stop: boolean;
+  scopedNoReply: boolean;
+  asksIdentity: boolean;
+  rules: TextReviewRule[];
+};
+
+const strictRuleMap = new Map<typeof strictRules[number][0], RegExp>(strictRules);
+
+function matchesStrictCategory(rule: TextReviewRule, text: string, s: string, visible: string): boolean {
+  switch (rule) {
+    case 'length': return text.length > 400;
+    case 'finance': return financial.test(s.replace(qianAsName, '')) || borrowedReturn.test(s) || transaction.test(visible);
+    case 'delegation': return delegatedTask.test(s) || reminderRequest.test(s);
+    case 'schedule': return timedRequest.test(s) || (strictRuleMap.get('schedule')?.test(visible) ?? false);
+    case 'credentials': return credentials.test(visible) || verificationCode.test(s);
+    case 'privacy': return (strictRuleMap.get('privacy')?.test(visible) ?? false) || directPrivacy.test(s) || sensitiveNumber.test(s);
+    case 'health': return (strictRuleMap.get('health')?.test(visible) ?? false) || medicalRecord.test(s) || directMedical.test(s);
+    case 'input-format': return /[\p{Cc}\p{Cf}]/u.test(text.replace(/\r?\n/g, ''));
+    case 'scoped-no-reply': return false;
+    default: return strictRuleMap.get(rule)?.test(visible) ?? false;
+  }
+}
+
+function collectStrictRules(text: string, s: string): TextReviewRule[] {
+  const hits: TextReviewRule[] = [];
+  const push = (rule: TextReviewRule) => { if (!hits.includes(rule)) hits.push(rule); };
+  if (text.length > 400) push('length');
+  if (financial.test(s.replace(qianAsName, '')) || borrowedReturn.test(s)) push('finance');
+  if (delegatedTask.test(s) || reminderRequest.test(s)) push('delegation');
+  if (timedRequest.test(s)) push('schedule');
+  const visible = s.replace(workYear, '');
+  for (const [name, pattern] of strictRules) if (pattern.test(visible)) push(name);
+  if (/[\p{Cc}\p{Cf}]/u.test(text.replace(/\r?\n/g, ''))) push('input-format');
+  return hits;
+}
+
+function collectHighRiskRules(s: string): TextReviewRule[] {
+  const hits: TextReviewRule[] = [];
+  if (credentials.test(s) || verificationCode.test(s)) hits.push('credentials');
+  if (transaction.test(s) || directPayment.test(s) || borrowedReturn.test(s)) hits.push('finance');
+  if (directPrivacy.test(s) || sensitiveNumber.test(s)) hits.push('privacy');
+  if (agreement.test(s)) hits.push('legal');
+  if (medicalRecord.test(s) || directMedical.test(s)) hits.push('health');
+  if (crisis.test(s)) hits.push('crisis');
+  return hits;
+}
+
+/** 返回单条来信命中的全部内置安全信号与规则类目，供 PolicyEngine 覆写与本地试测共用。 */
+export function inspectTextAll(
+  text: string,
+  level: 'strict' | 'recommended' | 'minimal' = 'strict',
+  extraRules: readonly TextReviewRule[] = [],
+  sanitizedNumbersText?: string,
+): TextInspection {
+  const s = normalized(text);
+  const unscoped = s.replace(scopedNoReply, '');
+  if (stop.test(unscoped)) return { stop: true, scopedNoReply: false, asksIdentity: false, rules: [] };
+  const hasScopedNoReply = unscoped !== s;
+  const asksIdentity = identity.test(s);
+  const rules: TextReviewRule[] = level === 'strict' ? collectStrictRules(text, s)
+    : level === 'recommended' ? collectHighRiskRules(s) : [];
+  if (extraRules.length > 0 && level !== 'strict') {
+    const visible = s.replace(workYear, '');
+    const numSource = sanitizedNumbersText ? normalized(sanitizedNumbersText).replace(workYear, '') : visible;
+    for (const rule of extraRules) {
+      if (rules.includes(rule)) continue;
+      if (rule === 'numbers') {
+        if (strictRuleMap.get('numbers')?.test(numSource)) rules.push(rule);
+      } else if (matchesStrictCategory(rule, text, s, visible)) {
+        rules.push(rule);
+      }
+    }
+  }
+  return { stop: false, scopedNoReply: hasScopedNoReply, asksIdentity, rules };
+}
 
 function strictReview(text: string, s: string): TextReviewRule | undefined {
-  if (text.length > 400) return 'length';
-  if (financial.test(s.replace(qianAsName, '')) || borrowedReturn.test(s)) return 'finance';
-  if (delegatedTask.test(s) || reminderRequest.test(s)) return 'delegation';
-  if (timedRequest.test(s)) return 'schedule';
-  const visible = s.replace(workYear, '');
-  return strictRules.find(([, pattern]) => pattern.test(visible))?.[0] ??
-    (/[\p{Cc}\p{Cf}]/u.test(text.replace(/\r?\n/g, '')) ? 'input-format' : undefined);
+  return collectStrictRules(text, s)[0];
 }
 
 function highRiskReview(s: string): TextReviewRule | undefined {
-  if (credentials.test(s) || verificationCode.test(s)) return 'credentials';
-  if (transaction.test(s) || directPayment.test(s) || borrowedReturn.test(s)) return 'finance';
-  if (directPrivacy.test(s) || sensitiveNumber.test(s)) return 'privacy';
-  if (agreement.test(s)) return 'legal';
-  if (medicalRecord.test(s) || directMedical.test(s)) return 'health';
-  if (crisis.test(s)) return 'crisis';
+  return collectHighRiskRules(s)[0];
 }
 
 export function inspectText(text: string, level: 'strict' | 'recommended' | 'minimal' = 'strict'): TextMatch | undefined {

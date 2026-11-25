@@ -52,6 +52,20 @@ const keywordListSchema = z.array(keywordItemSchema).max(64).default([]).transfo
   return out;
 });
 
+export const CUSTOMIZABLE_RULES = [
+  'credentials', 'finance', 'privacy', 'legal', 'health',
+  'instructions', 'link', 'commitment', 'schedule', 'delegation',
+  'sensitive-topic', 'numbers',
+] as const;
+export const customizableRuleSchema = z.enum(CUSTOMIZABLE_RULES);
+export type CustomizableRuleId = z.infer<typeof customizableRuleSchema>;
+
+export const ruleOverrideActionSchema = z.enum(['inherit', 'allow', 'skip_turn', 'draft_only', 'pause_session']);
+export type RuleOverrideAction = z.infer<typeof ruleOverrideActionSchema>;
+
+export const customBlockActionSchema = z.enum(['skip_turn', 'draft_only', 'pause_session']);
+export type CustomBlockAction = z.infer<typeof customBlockActionSchema>;
+
 const riskLevelSchema = z.enum(['recommended', 'strict', 'minimal']);
 const riskProfileSchema = z.strictObject({
   level: riskLevelSchema.optional(),
@@ -60,6 +74,9 @@ const riskProfileSchema = z.strictObject({
   takeoverAction: z.enum(['pause_session', 'cooldown', 'ignore']).default('pause_session'),
   takeoverCooldownMinutes: positiveInt.default(15),
   strictLegacyRules: z.boolean().default(false),
+  ruleOverrides: z.partialRecord(customizableRuleSchema, ruleOverrideActionSchema).default({}),
+  customBlockKeywords: keywordListSchema,
+  customBlockAction: customBlockActionSchema.default('pause_session'),
 });
 
 export const conversationPolicySchema = z.strictObject({

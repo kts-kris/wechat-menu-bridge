@@ -889,6 +889,17 @@ export class BridgeOrchestrator {
     } finally { this.previewAbort.delete(controller); }
   }
 
+  evaluatePolicy(params: RpcParams<'policy.evaluate'>): RpcResult<'policy.evaluate'> {
+    return new PolicyEngine().evaluate({
+      text: params.text,
+      policy: params.policy,
+      quietHours: params.quietHours ?? this.settings.runtime.quietHours,
+      mentionsSelf: params.mentionsSelf,
+      inQuietHours: params.inQuietHours,
+      nowMs: (this.options.quietHoursNow ?? Date.now)(),
+    });
+  }
+
   private addFeed(kind: FeedItem['kind'], id: string, title: string, body: string) {
     const item: FeedItem = { id: randomUUID(), kind, title, body, conversationId: id, createdAt: Date.now(), read: false };
     this.journal.saveFeedItem({ id: item.id, kind, title, body, conversation_id: id,

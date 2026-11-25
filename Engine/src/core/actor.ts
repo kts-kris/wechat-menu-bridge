@@ -85,14 +85,17 @@ export class ConversationActor {
     const narrowedTrigger = nextPolicy.type === 'group' && this.policy.groupTrigger === 'all' && nextPolicy.groupTrigger === 'mention_only';
     const changedKeywords = JSON.stringify(this.policy.triggerKeywords) !== JSON.stringify(nextPolicy.triggerKeywords) ||
       JSON.stringify(this.policy.ignoreKeywords) !== JSON.stringify(nextPolicy.ignoreKeywords);
+    const changedRules = JSON.stringify(this.policy.riskProfile.ruleOverrides) !== JSON.stringify(nextPolicy.riskProfile.ruleOverrides) ||
+      JSON.stringify(this.policy.riskProfile.customBlockKeywords) !== JSON.stringify(nextPolicy.riskProfile.customBlockKeywords) ||
+      this.policy.riskProfile.customBlockAction !== nextPolicy.riskProfile.customBlockAction;
     const changedLevel = this.riskLevel !== riskLevel(nextPolicy.riskProfile);
     this.policyValue = nextPolicy;
-    if (changedLevel) this.window = this.window.filter(event => this.keepsContext(event));
-    if (changedLevel || narrowedTrigger || changedKeywords) {
-      // 旧档或旧关键词门禁下已排队/拟好的回合不能继续发送；保留授权、锁和正在解析的媒体。
+    if (changedLevel || changedRules) this.window = this.window.filter(event => this.keepsContext(event));
+    if (changedLevel || narrowedTrigger || changedKeywords || changedRules) {
+      // 旧档或旧规则/关键词门禁下已排队/拟好的回合不能继续发送；保留授权、锁和正在解析的媒体。
       const eligible = changedLevel ? [] : this.queue.filter(event => {
         const check = this.engine.inbound(event, nextPolicy, false);
-        return check.action === 'allow' || check.action === 'identity';
+        return check.action === 'allow' || check.action === 'identity' || check.action === 'draft_only';
       });
       const removed = eligible.length !== this.queue.length;
       if (removed) this.invalidate();
@@ -224,8 +227,8 @@ export class ConversationActor {
 
   private keepsContext(event: NormalizedEvent) {
     const level = this.riskLevel;
-    const match = this.engine.inboundMatch(event.text, level);
-    return !match || (level === 'legacy' && match.action === 'manual');
+    const risk = this.engine.resolveRisk(event.text, this.policy.riskProfile);
+    return risk.kind === 'none' || (level === 'legacy' && risk.kind === 'manual');
   }
 
   private remember(event: NormalizedEvent) {
@@ -315,6 +318,15 @@ export class ConversationActor {
       return false;
     }
     if (!current && !this.shot) return false;
+    const isCrisisHit = outcome.review?.source === 'inbound' && outcome.review.rule === 'crisis';
+    if (isCrisisHit && outcome.action === 'pause_session' && (this.needsIngest || this.armed)) {
+      this.apply(outcome);
+      return false;
+    }
+    if (this.grant && this.statusValue.phase !== 'cooldown' && !isCrisisHit && this.activeQuietHoursAction() === 'skip_turn') {
+      this.options.onTrace?.('policy', 'info', '命中勿扰时段，已跳过本轮');
+      return false;
+    }
     if (outcome.action === 'pause_session' && (this.needsIngest || this.armed)) { this.apply(outcome); return false; }
     if (!this.grant) return false;
     if (this.statusValue.phase === 'cooldown') {
@@ -322,11 +334,7 @@ export class ConversationActor {
       this.options.onTrace?.('policy', 'info', `冷静期中跳过（剩余 ${seconds}s）`);
       return false;
     }
-    if (this.activeQuietHoursAction() === 'skip_turn') {
-      this.options.onTrace?.('policy', 'info', '命中勿扰时段，已跳过本轮');
-      return false;
-    }
-    if (media && (outcome.action === 'allow' || outcome.action === 'identity')) {
+    if (media && (outcome.action === 'allow' || outcome.action === 'identity' || outcome.action === 'draft_only')) {
       this.invalidate();
       this.processingRefs.add(event.messageRef);
       return true;
@@ -358,7 +366,7 @@ export class ConversationActor {
       }
       return;
     }
-    if (outcome.action !== 'allow' && outcome.action !== 'identity') { this.apply(outcome); return; }
+    if (outcome.action !== 'allow' && outcome.action !== 'identity' && outcome.action !== 'draft_only') { this.apply(outcome); return; }
     this.remember(event);
     this.invalidate();
     this.clearDraft();
@@ -446,7 +454,8 @@ export class ConversationActor {
       const refs = new Set(turn.map(event => event.messageRef));
       const context = this.context().filter(event => !refs.has(event.messageRef)).map((event): Context =>
         ({ from: event.isSelf ? 'auto' : 'peer', text: this.formatForModel(event) }));
-      const identity = turn.some(event => this.engine.inboundMatch(event.text, this.riskLevel)?.action === 'identity');
+      const identity = turn.some(event => this.engine.resolveRisk(event.text, this.policy.riskProfile).kind === 'identity');
+      const ruleDraftHit = turn.map(event => this.engine.inbound(event, this.policy, false)).find(d => d.action === 'draft_only');
       if (identity) this.options.onTrace?.('policy', 'info', '命中身份询问，使用固定说明');
       const decision = identity ? { action: 'identity' as const } :
         await this.options.generate(turn.map(event => this.formatForModel(event)), context, grant, controller.signal);
@@ -461,8 +470,10 @@ export class ConversationActor {
         this.show(this.shot ? 'scheduled' : 'listening');
         return;
       }
-      if (grant.mode === 'draft' || quietAction === 'draft_only') {
-        if (grant.mode === 'auto' && quietAction === 'draft_only') {
+      if (grant.mode === 'draft' || quietAction === 'draft_only' || ruleDraftHit) {
+        if (grant.mode === 'auto' && ruleDraftHit?.review) {
+          this.options.onTrace?.('policy', 'warn', `${reviewDescription(ruleDraftHit.review)} → 降级为只拟稿`, 'manual-review');
+        } else if (grant.mode === 'auto' && quietAction === 'draft_only') {
           this.options.onTrace?.('policy', 'info', '命中勿扰时段，已降级为只拟稿');
         }
         this.queue = [];

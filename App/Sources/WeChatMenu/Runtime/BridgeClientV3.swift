@@ -237,7 +237,7 @@ final class BridgeClientV3 {
     }
 }
 
-// MARK: - 35 个强类型 RPC
+// MARK: - 37 个强类型 RPC
 
 extension BridgeClientV3 {
     func systemStatus() async throws -> SystemStatus { try await call(.systemStatus, RPCParams.Empty()) }
@@ -275,6 +275,10 @@ extension BridgeClientV3 {
 
     func modelPreview(model: PreviewModel, text: String) async throws -> ModelPreviewResult {
         try await call(.modelPreview, RPCParams.Preview(model: model, text: text))
+    }
+
+    func policyEvaluate(_ params: RPCParams.PolicyEvaluate) async throws -> PolicyEvaluateResult {
+        try await call(.policyEvaluate, params)
     }
 
     func sessionArm(_ params: RPCParams.Arm) async throws {

@@ -81,6 +81,94 @@ extension RiskProfile.Level {
     }
 }
 
+extension CustomizableRuleId {
+    var title: String {
+        switch self {
+        case .credentials: return "账号凭据与验证码"
+        case .finance: return "资金转账与借还"
+        case .privacy: return "个人隐私与敏感号码"
+        case .legal: return "合同与签字"
+        case .health: return "诊疗与用药"
+        case .instructions: return "提示词与系统指令"
+        case .link: return "链接与邮箱"
+        case .commitment: return "承诺与代为表态"
+        case .schedule: return "时间与见面约定"
+        case .delegation: return "委托与提醒"
+        case .sensitiveTopic: return "敏感话题"
+        case .numbers: return "数字与金额格式"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .credentials: return "密码、验证码、OTP、API Key 等"
+        case .finance: return "转账、借还款、红包、报销、金额往来"
+        case .privacy: return "身份证、手机号、定位、住址等"
+        case .legal: return "合同、签字等法律承诺"
+        case .health: return "病历、诊断、用药剂量等"
+        case .instructions: return "要求忽略规则、扮演角色或越权指令"
+        case .link: return "网址、链接与电子邮箱地址"
+        case .commitment: return "要求承诺、保证或代为答应事项"
+        case .schedule: return "约见面、定时间点、聚餐开会等"
+        case .delegation: return "要求代办任务或提醒不要忘记"
+        case .sensitiveTopic: return "分手、投诉、报警、客户汇报等"
+        case .numbers: return "金额单位或敏感长数字串"
+        }
+    }
+}
+
+extension RuleOverrideAction {
+    var title: String {
+        switch self {
+        case .inherit: return "跟随档位"
+        case .allow: return "放行"
+        case .skipTurn: return "跳过本轮"
+        case .draftOnly: return "仅拟稿"
+        case .pauseSession: return "暂停会话"
+        }
+    }
+
+    var badgeTone: SessionPresentation.Tone {
+        switch self {
+        case .inherit: return .neutral
+        case .allow: return .active
+        case .skipTurn, .draftOnly: return .warning
+        case .pauseSession: return .critical
+        }
+    }
+}
+
+extension CustomBlockAction {
+    var title: String {
+        switch self {
+        case .skipTurn: return "跳过本轮"
+        case .draftOnly: return "仅拟稿"
+        case .pauseSession: return "暂停会话"
+        }
+    }
+}
+
+extension PolicyEvaluateResult.FinalAction {
+    var title: String {
+        switch self {
+        case .allow: return "放行进入模型"
+        case .draftOnly: return "降级为仅拟稿"
+        case .skipTurn: return "跳过本轮"
+        case .pauseSession: return "暂停会话"
+        case .lockPeer: return "永久锁定退订"
+        case .identity: return "固定身份说明"
+        }
+    }
+
+    var tone: SessionPresentation.Tone {
+        switch self {
+        case .allow, .identity: return .active
+        case .draftOnly, .skipTurn: return .warning
+        case .pauseSession, .lockPeer: return .critical
+        }
+    }
+}
+
 // 列表和菜单栏共用的紧凑状态：蓝=自动回复、青=拟稿、橙=冷静期、红=需处理、灰=未开启。
 enum ConversationStatusDot: Equatable {
     case autoReply, drafting, cooldown, attention, off
@@ -620,6 +708,8 @@ private struct ConversationDetail: View {
                     turnActionRow("图片/语音无法解析时", riskBinding(\.unparsedMediaAction))
                 }
                 keywordFilterRows
+                ruleManagementRows
+                ruleSimulatorRows
             }
         }
     }
@@ -631,6 +721,35 @@ private struct ConversationDetail: View {
             ignoreKeywords: policy.ignoreKeywords,
             onUpdateTriggers: { items in sessions.updatePolicy(conversationId) { $0.triggerKeywords = items } },
             onUpdateIgnores: { items in sessions.updatePolicy(conversationId) { $0.ignoreKeywords = items } }
+        )
+    }
+
+    private var ruleManagementRows: some View {
+        RuleManagementSection(
+            riskProfile: policy.riskProfile,
+            onSetOverride: { rule, action in
+                sessions.updatePolicy(conversationId) {
+                    if action == .inherit { $0.riskProfile.ruleOverrides.removeValue(forKey: rule) }
+                    else { $0.riskProfile.ruleOverrides[rule] = action }
+                }
+            },
+            onResetOverrides: {
+                sessions.updatePolicy(conversationId) { $0.riskProfile.ruleOverrides.removeAll() }
+            },
+            onUpdateCustomBlockKeywords: { items in
+                sessions.updatePolicy(conversationId) { $0.riskProfile.customBlockKeywords = items }
+            },
+            onUpdateCustomBlockAction: { action in
+                sessions.updatePolicy(conversationId) { $0.riskProfile.customBlockAction = action }
+            }
+        )
+    }
+
+    private var ruleSimulatorRows: some View {
+        RuleSimulatorSection(
+            workspace: workspace,
+            policy: policy,
+            quietHours: settings.draft.runtime.quietHours
         )
     }
 
@@ -852,6 +971,274 @@ private struct KeywordFilterSection: View {
             }
         }
         .accessibilityIdentifier("conversation-keyword-filters")
+    }
+}
+
+struct RuleManagementSection: View {
+    let riskProfile: RiskProfile
+    let onSetOverride: (CustomizableRuleId, RuleOverrideAction) -> Void
+    let onResetOverrides: () -> Void
+    let onUpdateCustomBlockKeywords: ([String]) -> Void
+    let onUpdateCustomBlockAction: (CustomBlockAction) -> Void
+
+    @State private var customBlockText: String
+    @State private var expanded: Bool
+
+    private static let lockedIronRules: [(title: String, badge: String)] = [
+        ("退订 / 叫停锁（peer-stopped）", "永久锁定"),
+        ("人身安全（crisis）", "不可放行"),
+        ("身份披露与防冒充（identity）", "不可关闭"),
+        ("未知回执防重发（send-unknown）", "不可关闭"),
+        ("历史补扫不发信（backfill）", "不可关闭"),
+    ]
+
+    init(riskProfile: RiskProfile, expanded: Bool = false,
+         onSetOverride: @escaping (CustomizableRuleId, RuleOverrideAction) -> Void,
+         onResetOverrides: @escaping () -> Void,
+         onUpdateCustomBlockKeywords: @escaping ([String]) -> Void,
+         onUpdateCustomBlockAction: @escaping (CustomBlockAction) -> Void) {
+        self.riskProfile = riskProfile
+        self.onSetOverride = onSetOverride
+        self.onResetOverrides = onResetOverrides
+        self.onUpdateCustomBlockKeywords = onUpdateCustomBlockKeywords
+        self.onUpdateCustomBlockAction = onUpdateCustomBlockAction
+        _customBlockText = State(initialValue: ConversationPolicy.formatKeywords(riskProfile.customBlockKeywords))
+        _expanded = State(initialValue: expanded)
+    }
+
+    var body: some View {
+        let overrideCount = riskProfile.activeOverrideCount
+        let customCount = riskProfile.customBlockKeywords.count
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("不可关闭的安全铁律", systemImage: "lock.shield.fill")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    ForEach(Self.lockedIronRules, id: \.title) { item in
+                        HStack(spacing: 6) {
+                            Image(systemName: "lock.fill").font(.caption2).foregroundStyle(.secondary)
+                            Text(item.title).font(.caption)
+                            Spacer()
+                            StatusPill(text: item.badge, tone: .neutral)
+                        }
+                    }
+                }
+                .padding(8)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                HStack {
+                    Text("内置 12 类规则（按会话覆盖）").font(.callout.weight(.medium))
+                    Spacer()
+                    if overrideCount > 0 {
+                        Button("恢复全部默认", action: onResetOverrides)
+                            .buttonStyle(.link).font(.caption)
+                            .accessibilityIdentifier("rule-overrides-reset")
+                    }
+                }
+
+                VStack(spacing: 6) {
+                    ForEach(CustomizableRuleId.allCases) { rule in
+                        let currentOverride = riskProfile.ruleOverrides[rule] ?? .inherit
+                        let effective = riskProfile.effectiveAction(for: rule)
+                        HStack(alignment: .center, spacing: 8) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                HStack(spacing: 5) {
+                                    Text(rule.title).font(.callout)
+                                    StatusPill(
+                                        text: currentOverride == .inherit ? "默认·\(effective.title)" : effective.title,
+                                        tone: effective.badgeTone
+                                    )
+                                }
+                                Text(rule.summary).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 8)
+                            Picker(rule.title, selection: Binding(
+                                get: { riskProfile.ruleOverrides[rule] ?? .inherit },
+                                set: { onSetOverride(rule, $0) }
+                            )) {
+                                ForEach(RuleOverrideAction.allCases, id: \.self) { action in
+                                    Text(action.title).tag(action)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 112)
+                            .accessibilityIdentifier("rule-override-\(rule.rawValue)")
+                        }
+                        if rule != CustomizableRuleId.allCases.last { Divider() }
+                    }
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("自定义必拦词（人工审核词）").font(.callout.weight(.medium))
+                        Spacer()
+                        if customCount > 0 { StatusPill(text: "\(customCount) 项", tone: .critical) }
+                    }
+                    TextField("用逗号分隔，例如：报价，生产事故，合同编号", text: $customBlockText)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("rule-custom-block-keywords")
+                        .onChange(of: customBlockText) { raw in
+                            let parsed = ConversationPolicy.parseKeywords(raw)
+                            if parsed != riskProfile.customBlockKeywords { onUpdateCustomBlockKeywords(parsed) }
+                        }
+                        .onChange(of: riskProfile.customBlockKeywords) { latest in
+                            if ConversationPolicy.parseKeywords(customBlockText) != latest {
+                                customBlockText = ConversationPolicy.formatKeywords(latest)
+                            }
+                        }
+                    Picker("命中必拦词时", selection: Binding(
+                        get: { riskProfile.customBlockAction },
+                        set: { onUpdateCustomBlockAction($0) }
+                    )) {
+                        ForEach(CustomBlockAction.allCases, id: \.self) { action in
+                            Text(action.title).tag(action)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("rule-custom-block-action")
+                    Text("消息包含任一必拦词时按所选动作处理；运行轨迹仅记录命中风控，不写入词条或消息正文。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Text("规则明细与自定义")
+                if overrideCount > 0 { StatusPill(text: "覆写 \(overrideCount) 项", tone: .active) }
+                if customCount > 0 { StatusPill(text: "必拦 \(customCount) 项", tone: .warning) }
+            }
+        }
+        .accessibilityIdentifier("conversation-rule-management")
+    }
+}
+
+struct RuleSimulatorSection: View {
+    @ObservedObject var workspace: V2Workspace
+    let policy: ConversationPolicy
+    let quietHours: SettingsV2.QuietHours
+
+    @State private var expanded: Bool
+    @State private var sampleText: String
+    @State private var simulateQuietHours = false
+    @State private var simulateMentionsSelf = false
+    @State private var running = false
+    @State private var result: PolicyEvaluateResult?
+    @State private var fault: String?
+
+    init(workspace: V2Workspace, policy: ConversationPolicy, quietHours: SettingsV2.QuietHours,
+         expanded: Bool = false, initialText: String = "", initialResult: PolicyEvaluateResult? = nil) {
+        self.workspace = workspace
+        self.policy = policy
+        self.quietHours = quietHours
+        _expanded = State(initialValue: expanded)
+        _sampleText = State(initialValue: initialText)
+        _result = State(initialValue: initialResult)
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("纯本地执行与运行期一致的 5 步判定链（不调用模型、不发信、不写日志），直接按当前草稿策略试测。")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    TextField("输入任意例句，例如：周末一起吃饭吗？或 验证码 123456", text: $sampleText)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("rule-simulator-input")
+                    if running { ProgressView().controlSize(.small) }
+                    Button("测试判定", action: runEvaluation)
+                        .disabled(running || !workspace.runtime.ready || sampleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityIdentifier("rule-simulator-run")
+                }
+                HStack(spacing: 14) {
+                    Toggle("模拟处于勿扰时段", isOn: $simulateQuietHours)
+                        .toggleStyle(.checkbox).controlSize(.small)
+                        .accessibilityIdentifier("rule-simulator-quiet")
+                    if policy.type == .group {
+                        Toggle("模拟群内被 @", isOn: $simulateMentionsSelf)
+                            .toggleStyle(.checkbox).controlSize(.small)
+                            .accessibilityIdentifier("rule-simulator-mention")
+                    }
+                }
+                if let fault {
+                    InlineNotice(text: v2Explanation(fault), tone: .critical)
+                }
+                if let result {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text("判定结论").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            StatusPill(text: result.finalAction.title, tone: result.finalAction.tone)
+                            if let matched = result.matchedRule {
+                                Text(matched).font(.caption.monospaced()).foregroundStyle(.secondary)
+                            }
+                        }
+                        ForEach(result.steps) { step in
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: icon(for: step.outcome))
+                                    .foregroundStyle(color(for: step.outcome))
+                                    .font(.caption)
+                                    .padding(.top, 2)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(step.title).font(.caption.weight(.medium))
+                                    Text(step.detail).font(.caption).foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                    }
+                    .padding(8)
+                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .accessibilityIdentifier("rule-simulator-result")
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Text("规则判定试测")
+                Text("本地零开销").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityIdentifier("conversation-rule-simulator")
+    }
+
+    private func icon(for outcome: PolicyEvaluateStep.Outcome) -> String {
+        switch outcome {
+        case .pass: return "checkmark.circle.fill"
+        case .hit: return "exclamationmark.triangle.fill"
+        case .skip: return "minus.circle"
+        }
+    }
+
+    private func color(for outcome: PolicyEvaluateStep.Outcome) -> Color {
+        switch outcome {
+        case .pass: return .green
+        case .hit: return .orange
+        case .skip: return .secondary
+        }
+    }
+
+    private func runEvaluation() {
+        let trimmed = sampleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let client = workspace.runtime.client
+        let params = RPCParams.PolicyEvaluate(
+            text: trimmed,
+            policy: policy,
+            quietHours: quietHours,
+            mentionsSelf: simulateMentionsSelf,
+            inQuietHours: simulateQuietHours
+        )
+        running = true
+        fault = nil
+        Task { @MainActor in
+            defer { running = false }
+            do {
+                result = try await client.policyEvaluate(params)
+            } catch {
+                fault = V2Workspace.code(error)
+            }
+        }
     }
 }
 
