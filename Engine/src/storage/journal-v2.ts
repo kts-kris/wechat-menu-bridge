@@ -6,7 +6,7 @@ import type { Timing } from '../../journal.ts';
 import type { Receipt } from '../../mcp.ts';
 import { BridgeError, isErrorCode, type ErrorCode } from '../contracts/errors.ts';
 import type { MessageKind } from '../contracts/events.ts';
-import type { PerfStage, PerfStageSummary, SystemMetricsResult, TurnPerfSample } from '../contracts/ipc.ts';
+import type { PerfStage, PerfStageSummary, PresetPerfSummary, SystemMetricsResult, TurnPerfSample } from '../contracts/ipc.ts';
 import type { PluginPermission } from '../contracts/plugins.ts';
 import { assertPrivateFile, ensurePrivateDir } from './fs-safe.ts';
 import { migrateJournalToV2 } from './migrations.ts';
@@ -85,9 +85,23 @@ type StoredTurnMetric = {
   model_ttft_ms: number; model_total_ms: number; fence_ms: number; send_wire_ms: number;
   total_ms: number; bottleneck: PerfStage; model_mode: 'local' | 'cloud' | null;
   effort: 'default' | 'low' | 'medium' | 'high' | 'max' | null; fallback_used: 0 | 1; error_code: string | null;
+  preset_id: string | null; model_name: string | null;
+  prompt_tokens: number; cached_tokens: number; completion_tokens: number; estimated_cost_usd: number;
 };
 
+function roundUsd(value: number): number {
+  return Math.round(Math.max(0, value) * 1_000_000) / 1_000_000;
+}
+
+function kvHitRate(promptTokens: number, cachedTokens: number): number {
+  if (promptTokens <= 0) return 0;
+  return Math.min(100, Math.max(0, Math.round((cachedTokens / promptTokens) * 100)));
+}
+
 function toTurnMetricSample(row: StoredTurnMetric): TurnPerfSample {
+  const promptTokens = Math.max(0, Math.round(row.prompt_tokens ?? 0));
+  const cachedTokens = Math.min(promptTokens, Math.max(0, Math.round(row.cached_tokens ?? 0)));
+  const completionTokens = Math.max(0, Math.round(row.completion_tokens ?? 0));
   return {
     id: row.id,
     conversationId: row.conversation_id,
@@ -107,6 +121,12 @@ function toTurnMetricSample(row: StoredTurnMetric): TurnPerfSample {
     ...(row.effort && { effort: row.effort }),
     fallbackUsed: row.fallback_used === 1,
     ...(row.error_code && isErrorCode(row.error_code) && { errorCode: row.error_code }),
+    ...(row.preset_id && { presetId: row.preset_id }),
+    ...(row.model_name && { modelName: row.model_name }),
+    promptTokens,
+    cachedTokens,
+    completionTokens,
+    estimatedCostUsd: roundUsd(row.estimated_cost_usd ?? 0),
   };
 }
 
@@ -265,15 +285,21 @@ export class JournalV2 {
       rpc: quantiles('rpc'), total: quantiles('total') } : undefined;
   }
 
-  recordTurnMetric(sample: TurnPerfSample) {
+  recordTurnMetric(sample: Omit<TurnPerfSample, 'promptTokens' | 'cachedTokens' | 'completionTokens' | 'estimatedCostUsd'> &
+    Partial<Pick<TurnPerfSample, 'promptTokens' | 'cachedTokens' | 'completionTokens' | 'estimatedCostUsd'>>) {
+    const promptTokens = Math.max(0, Math.round(sample.promptTokens ?? 0));
+    const cachedTokens = Math.min(promptTokens, Math.max(0, Math.round(sample.cachedTokens ?? 0)));
+    const completionTokens = Math.max(0, Math.round(sample.completionTokens ?? 0));
     this.db.transaction(() => {
       this.db.query(`INSERT OR REPLACE INTO turn_metrics(
         id,conversation_id,at,outcome,ingest_ms,debounce_ms,prompt_ms,prompt_cache_hit,
         model_ttft_ms,model_total_ms,fence_ms,send_wire_ms,total_ms,bottleneck,
-        model_mode,effort,fallback_used,error_code)
+        model_mode,effort,fallback_used,error_code,
+        preset_id,model_name,prompt_tokens,cached_tokens,completion_tokens,estimated_cost_usd)
         VALUES($id,$conversation_id,$at,$outcome,$ingest_ms,$debounce_ms,$prompt_ms,$prompt_cache_hit,
         $model_ttft_ms,$model_total_ms,$fence_ms,$send_wire_ms,$total_ms,$bottleneck,
-        $model_mode,$effort,$fallback_used,$error_code)`).run({
+        $model_mode,$effort,$fallback_used,$error_code,
+        $preset_id,$model_name,$prompt_tokens,$cached_tokens,$completion_tokens,$estimated_cost_usd)`).run({
         id: sample.id,
         conversation_id: sample.conversationId,
         at: sample.at,
@@ -292,6 +318,12 @@ export class JournalV2 {
         effort: sample.effort ?? null,
         fallback_used: sample.fallbackUsed ? 1 : 0,
         error_code: sample.errorCode ?? null,
+        preset_id: sample.presetId ?? null,
+        model_name: sample.modelName?.slice(0, 160) ?? null,
+        prompt_tokens: promptTokens,
+        cached_tokens: cachedTokens,
+        completion_tokens: completionTokens,
+        estimated_cost_usd: roundUsd(sample.estimatedCostUsd ?? 0),
       });
       this.db.run('DELETE FROM turn_metrics WHERE at < ?', [sample.at - METRIC_RETENTION_DAYS * DAY]);
       this.db.run('DELETE FROM turn_metrics WHERE rowid IN (SELECT rowid FROM turn_metrics ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?)', [METRIC_MAX_ROWS]);
@@ -356,6 +388,43 @@ export class JournalV2 {
       }
     }
 
+    const totalPromptTokens = samples.reduce((acc, s) => acc + s.promptTokens, 0);
+    const totalCachedTokens = samples.reduce((acc, s) => acc + s.cachedTokens, 0);
+    const totalCompletionTokens = samples.reduce((acc, s) => acc + s.completionTokens, 0);
+    const totalCostUsd = roundUsd(samples.reduce((acc, s) => acc + s.estimatedCostUsd, 0));
+
+    const presetBuckets = new Map<string, TurnPerfSample[]>();
+    for (const s of samples) {
+      if (!s.presetId && !s.modelName && s.modelTotalMs === 0 && s.promptTokens === 0) continue;
+      const key = s.presetId ?? s.modelName ?? 'unknown';
+      const list = presetBuckets.get(key) ?? [];
+      if (!list.length) presetBuckets.set(key, list);
+      list.push(s);
+    }
+    const byPreset: PresetPerfSummary[] = [...presetBuckets.entries()].map(([presetId, items]) => {
+      const pTotals = items.map(i => i.totalMs).sort((a, b) => a - b);
+      const pTtfts = items.map(i => i.modelTtftMs).sort((a, b) => a - b);
+      const pPrompt = items.reduce((acc, i) => acc + i.promptTokens, 0);
+      const pCached = items.reduce((acc, i) => acc + i.cachedTokens, 0);
+      const pCompletion = items.reduce((acc, i) => acc + i.completionTokens, 0);
+      const pCost = roundUsd(items.reduce((acc, i) => acc + i.estimatedCostUsd, 0));
+      const latest = items[0]!;
+      return {
+        presetId,
+        modelName: latest.modelName ?? presetId,
+        ...(latest.modelMode && { mode: latest.modelMode }),
+        turns: items.length,
+        p50TotalMs: percentile(pTotals, 0.5),
+        p95TotalMs: percentile(pTotals, 0.95),
+        p50TtftMs: percentile(pTtfts, 0.5),
+        promptTokens: pPrompt,
+        cachedTokens: pCached,
+        completionTokens: pCompletion,
+        kvCacheHitRate: kvHitRate(pPrompt, pCached),
+        estimatedCostUsd: pCost,
+      };
+    }).sort((a, b) => b.turns - a.turns || a.p50TotalMs - b.p50TotalMs);
+
     return {
       windowHours,
       sampleCount: samples.length,
@@ -368,8 +437,16 @@ export class JournalV2 {
         maxMs: totals.at(-1) ?? 0,
         avgMs: samples.length ? Math.round(totalSum / samples.length) : 0,
       },
+      tokens: {
+        promptTokens: totalPromptTokens,
+        cachedTokens: totalCachedTokens,
+        completionTokens: totalCompletionTokens,
+        kvCacheHitRate: kvHitRate(totalPromptTokens, totalCachedTokens),
+        estimatedCostUsd: totalCostUsd,
+      },
       ...(primaryBottleneck && { primaryBottleneck }),
       stages,
+      byPreset,
       recent: samples.slice(0, recentLimit),
     };
   }

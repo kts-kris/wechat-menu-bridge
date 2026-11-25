@@ -1,24 +1,36 @@
 import { BridgeError, type ModelConfig } from '../../contracts.ts';
 import { type ErrorCode } from '../contracts/errors.ts';
-import { untilAborted } from './sse.ts';
+import { untilAborted, type TokenUsage } from './sse.ts';
 
 type Effort = Exclude<ModelConfig['reasoningEffort'], 'default'>;
 export type ModelTrace = (level: 'info' | 'warn' | 'error', summary: string, code?: ErrorCode) => void;
-export type ModelTiming = { firstByteMs: number; totalMs: number; effort: NonNullable<Effort> | 'default' };
+export type ModelTiming = {
+  firstByteMs: number;
+  totalMs: number;
+  effort: NonNullable<Effort> | 'default';
+  usage?: TokenUsage;
+};
 type Options<T> = {
-  url: URL; key?: string; mode: 'local' | 'cloud'; effort?: Effort;
+  url: URL; key?: string; mode: 'local' | 'cloud'; effort?: Effort; includeStreamUsage?: boolean;
   timeoutMs: number; signal?: AbortSignal; onTrace?: ModelTrace; retryFormat?: boolean;
-  body: (effort: Effort, correctFormat: boolean) => string | FormData;
-  parse: (response: Response, signal: AbortSignal, onFirstByte: () => void) => Promise<T>;
+  body: (effort: Effort, correctFormat: boolean, includeUsage: boolean) => string | FormData;
+  parse: (response: Response, signal: AbortSignal, onFirstByte: () => void, onUsage: (usage: TokenUsage) => void) => Promise<T>;
   onTiming?: (timing: ModelTiming) => void;
 };
 
 const capabilities = new Map<string, Set<string>>();
 const reasoning = 'reasoning_effort';
+const streamOptions = 'stream_options';
 const transientStatus = new Set([502, 503, 504]);
 const backoffs = [600, 1500];
 
 export function resetEndpointCapabilities() { capabilities.clear(); }
+
+function disableCapability(href: string, name: string) {
+  let set = capabilities.get(href);
+  if (!set) { set = new Set(); capabilities.set(href, set); }
+  set.add(name);
+}
 
 function retryAfter(response: Response) {
   const header = response.headers.get('retry-after')?.trim() ?? '';
@@ -31,9 +43,9 @@ function wait(ms: number, signal: AbortSignal) {
   return untilAborted(task, signal).finally(() => clearTimeout(timer));
 }
 
-async function rejectsEffort(response: Response, signal: AbortSignal) {
+async function readErrorDetail(response: Response, signal: AbortSignal) {
   const reader = response.body?.getReader();
-  if (!reader) return false;
+  if (!reader) return '';
   const decoder = new TextDecoder();
   let detail = '';
   try {
@@ -42,10 +54,13 @@ async function rejectsEffort(response: Response, signal: AbortSignal) {
       if (done) break;
       detail += decoder.decode(value.subarray(0, 16_384 - detail.length), { stream: true });
     }
-    return /reasoning_effort/i.test(detail) &&
-      /unsupported|not supported|not allowed|not permitted|unrecognized|unknown|unexpected|extra_forbidden|不支持/i.test(detail);
+    return detail;
   } finally { void reader.cancel().catch(() => {}); }
 }
+
+const unsupportedPattern = /unsupported|not supported|not allowed|not permitted|unrecognized|unknown|unexpected|extra_forbidden|invalid|不支持/i;
+const rejectsEffort = (detail: string) => /reasoning_effort/i.test(detail) && unsupportedPattern.test(detail);
+const rejectsStreamOptions = (detail: string) => /stream_options|include_usage/i.test(detail) && unsupportedPattern.test(detail);
 
 export async function requestModel<T>(options: Options<T>): Promise<T> {
   const { url, key, mode, timeoutMs, onTrace, signal } = options;
@@ -55,14 +70,17 @@ export async function requestModel<T>(options: Options<T>): Promise<T> {
   const started = performance.now();
   const endsAt = started + timeoutMs;
   let effort = options.effort;
+  let includeUsage = options.includeStreamUsage === true;
   let transientRetries = 0, rateRetries = 0;
   let corrected = false, downgraded = false;
   const canRetry = (delay: number) => endsAt - performance.now() > delay;
   try {
     for (;;) {
       combined.throwIfAborted();
-      if (capabilities.get(url.href)?.has(reasoning)) effort = undefined;
-      const payload = options.body(effort, corrected);
+      const disabled = capabilities.get(url.href);
+      if (disabled?.has(reasoning)) effort = undefined;
+      if (disabled?.has(streamOptions)) includeUsage = false;
+      const payload = options.body(effort, corrected, includeUsage);
       onTrace?.('info', `开始调用${mode === 'cloud' ? '云模型' : '本地模型'}（reasoning_effort=${effort ?? '未发送'}）`);
       let status: number | undefined;
       let rateDelay = 1500;
@@ -86,23 +104,35 @@ export async function requestModel<T>(options: Options<T>): Promise<T> {
         } finally { clearTimeout(firstByteTimer); }
         if (response.ok) {
           let firstByteAt: number | undefined;
+          let usage: TokenUsage | undefined;
           const onFirstByte = () => { firstByteAt ??= performance.now(); };
-          const result = await untilAborted(options.parse(response, combined, onFirstByte), combined);
+          const onUsage = (value: TokenUsage) => { usage = value; };
+          const result = await untilAborted(options.parse(response, combined, onFirstByte, onUsage), combined);
           if (firstByteAt !== undefined) options.onTiming?.({
             firstByteMs: Math.round(firstByteAt - attemptStarted),
             totalMs: Math.round(performance.now() - started),
             effort: effort ?? 'default',
+            ...(usage && { usage }),
           });
           return result;
         }
         status = response.status;
-        if (status === 400 && effort) {
-          if (await rejectsEffort(response, combined)) {
-            capabilities.set(url.href, new Set([reasoning]));
+        if (status === 400 && (effort || includeUsage)) {
+          const detail = await readErrorDetail(response, combined);
+          let retried = false;
+          if (effort && rejectsEffort(detail)) {
+            disableCapability(url.href, reasoning);
             effort = undefined;
             onTrace?.('warn', '上游不支持 reasoning_effort，已移除该字段并重试');
-            continue;
+            retried = true;
           }
+          if (includeUsage && rejectsStreamOptions(detail)) {
+            disableCapability(url.href, streamOptions);
+            includeUsage = false;
+            onTrace?.('warn', '上游不支持 stream_options，已移除用量选项并重试');
+            retried = true;
+          }
+          if (retried) continue;
         } else {
           if (status === 429) rateDelay = retryAfter(response);
           void response.body?.cancel().catch(() => {});

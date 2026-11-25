@@ -19,6 +19,12 @@ export type ChatTurnTiming = {
   modelMode: 'local' | 'cloud';
   effort: ModelTiming['effort'];
   fallbackUsed: boolean;
+  presetId?: string;
+  modelName?: string;
+  promptTokens: number;
+  cachedTokens: number;
+  completionTokens: number;
+  estimatedCostUsd: number;
 };
 type ChatRequest = ModelRequest & {
   fallbackPresetId?: string; fallbackCloudApproved?: boolean; onTrace?: ModelTrace;
@@ -130,11 +136,26 @@ export class ModelRouter {
     let promptMs = 0;
     let promptCacheHit = false;
     let activeMode: 'local' | 'cloud' = this.presets.get(id)?.mode ?? 'local';
+    let activePreset: ModelPreset | undefined = this.presets.get(id);
     let fallbackUsed = false;
     const primary = this.presets.get(id);
     const fallback = fallbackPresetId && this.presets.get(fallbackPresetId);
     const eligible = fallback && fallback.id !== id && fallback.kind === 'chat' && (fallback.mode === 'local' || fallbackCloudApproved)
       ? fallback : undefined;
+    const buildTurnTiming = (): ChatTurnTiming => ({
+      promptMs,
+      promptCacheHit,
+      ttftMs: timing?.firstByteMs ?? 0,
+      modelTotalMs: timing?.totalMs ?? Math.max(0, Math.round(performance.now() - started) - promptMs),
+      modelMode: activeMode,
+      effort: timing?.effort ?? 'default',
+      fallbackUsed,
+      ...(activePreset && { presetId: activePreset.id, modelName: activePreset.modelName }),
+      promptTokens: timing?.usage?.promptTokens ?? 0,
+      cachedTokens: timing?.usage?.cachedTokens ?? 0,
+      completionTokens: timing?.usage?.completionTokens ?? 0,
+      estimatedCostUsd: 0,
+    });
     const execute = async (preset: ModelPreset | undefined, request: ModelRequest, budget: number) => {
       const timeoutMs = Math.floor(started + budget - performance.now());
       if (timeoutMs <= 0) throw new BridgeError('model-timeout');
@@ -144,6 +165,7 @@ export class ModelRouter {
         return await this.model(preset, 'chat', { priority: 'reply', ...request, signal: attemptSignal }, async client => {
           const mode = client.mode;
           activeMode = mode;
+          activePreset = preset;
           const promptStarted = performance.now();
           const profile = profileForMode ? await untilAborted(profileForMode(mode), attemptSignal) :
             (preset === primary || primary?.mode === mode ? { style: request.style, memory: request.memory } : undefined);
@@ -175,28 +197,12 @@ export class ModelRouter {
       }
       const labels = { reply: '回复', skip: '跳过', manual: '转人工', stop: '停止回复', identity: '说明身份' };
       if (timing) onTrace?.('info', `模型决策：${labels[decision.action]}（首包 ${timing.firstByteMs}ms / 共 ${timing.totalMs}ms · effort=${timing.effort}）`);
-      onTurnTiming?.({
-        promptMs,
-        promptCacheHit,
-        ttftMs: timing?.firstByteMs ?? 0,
-        modelTotalMs: timing?.totalMs ?? Math.max(0, Math.round(performance.now() - started) - promptMs),
-        modelMode: activeMode,
-        effort: timing?.effort ?? 'default',
-        fallbackUsed,
-      });
+      onTurnTiming?.(buildTurnTiming());
       return decision;
     } catch (error) {
       if (!signal?.aborted) {
         onTrace?.('error', '模型调用失败', errorCode(error));
-        onTurnTiming?.({
-          promptMs,
-          promptCacheHit,
-          ttftMs: timing?.firstByteMs ?? 0,
-          modelTotalMs: timing?.totalMs ?? Math.max(0, Math.round(performance.now() - started) - promptMs),
-          modelMode: activeMode,
-          effort: timing?.effort ?? 'default',
-          fallbackUsed,
-        });
+        onTurnTiming?.(buildTurnTiming());
       }
       throw error;
     }

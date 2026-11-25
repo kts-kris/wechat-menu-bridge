@@ -489,6 +489,12 @@ export class ConversationActor {
         totalMs,
         bottleneck: classifyTurnBottleneck({ ingestMs, debounceMs, promptMs, modelTtftMs, modelTotalMs, fenceMs, sendWireMs }),
         ...(modelTiming && { modelMode: modelTiming.modelMode, effort: modelTiming.effort }),
+        ...(modelTiming?.presetId && { presetId: modelTiming.presetId }),
+        ...(modelTiming?.modelName && { modelName: modelTiming.modelName }),
+        promptTokens: modelTiming?.promptTokens ?? 0,
+        cachedTokens: modelTiming?.cachedTokens ?? 0,
+        completionTokens: modelTiming?.completionTokens ?? 0,
+        estimatedCostUsd: modelTiming?.estimatedCostUsd ?? 0,
         fallbackUsed: modelTiming?.fallbackUsed ?? false,
         ...(errorCodeValue && { errorCode: errorCodeValue }),
       };

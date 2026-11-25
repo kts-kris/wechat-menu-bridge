@@ -879,9 +879,70 @@ struct TurnPerfSample: Codable, Equatable, Identifiable, Sendable {
     var effort: ReasoningEffort? = nil
     var fallbackUsed: Bool
     var errorCode: IPCErrorCode? = nil
+    var presetId: String? = nil
+    var modelName: String? = nil
+    var promptTokens: Int = 0
+    var cachedTokens: Int = 0
+    var completionTokens: Int = 0
+    var estimatedCostUsd: Double = 0
 
     var modelGenMs: Int { max(0, modelTotalMs - modelTtftMs) }
     var sendTotalMs: Int { fenceMs + sendWireMs }
+    var kvCacheHitRate: Int { promptTokens > 0 ? min(100, Int((Double(cachedTokens) / Double(promptTokens) * 100.0).rounded())) : 0 }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, conversationId, at, outcome, ingestMs, debounceMs, promptMs, promptCacheHit
+        case modelTtftMs, modelTotalMs, fenceMs, sendWireMs, totalMs, bottleneck
+        case modelMode, effort, fallbackUsed, errorCode
+        case presetId, modelName, promptTokens, cachedTokens, completionTokens, estimatedCostUsd
+    }
+
+    init(id: String, conversationId: String, at: Int64, outcome: TurnPerfOutcome,
+         ingestMs: Int, debounceMs: Int, promptMs: Int, promptCacheHit: Bool,
+         modelTtftMs: Int, modelTotalMs: Int, fenceMs: Int, sendWireMs: Int,
+         totalMs: Int, bottleneck: PerfStage, modelMode: ModelMode? = nil, effort: ReasoningEffort? = nil,
+         fallbackUsed: Bool, errorCode: IPCErrorCode? = nil,
+         presetId: String? = nil, modelName: String? = nil,
+         promptTokens: Int = 0, cachedTokens: Int = 0, completionTokens: Int = 0, estimatedCostUsd: Double = 0) {
+        self.id = id; self.conversationId = conversationId; self.at = at; self.outcome = outcome
+        self.ingestMs = ingestMs; self.debounceMs = debounceMs; self.promptMs = promptMs; self.promptCacheHit = promptCacheHit
+        self.modelTtftMs = modelTtftMs; self.modelTotalMs = modelTotalMs; self.fenceMs = fenceMs; self.sendWireMs = sendWireMs
+        self.totalMs = totalMs; self.bottleneck = bottleneck; self.modelMode = modelMode; self.effort = effort
+        self.fallbackUsed = fallbackUsed; self.errorCode = errorCode
+        self.presetId = presetId; self.modelName = modelName
+        self.promptTokens = promptTokens; self.cachedTokens = cachedTokens
+        self.completionTokens = completionTokens; self.estimatedCostUsd = estimatedCostUsd
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try c.decode(String.self, forKey: .id),
+            conversationId: try c.decode(String.self, forKey: .conversationId),
+            at: try c.decode(Int64.self, forKey: .at),
+            outcome: try c.decode(TurnPerfOutcome.self, forKey: .outcome),
+            ingestMs: try c.decode(Int.self, forKey: .ingestMs),
+            debounceMs: try c.decode(Int.self, forKey: .debounceMs),
+            promptMs: try c.decode(Int.self, forKey: .promptMs),
+            promptCacheHit: try c.decode(Bool.self, forKey: .promptCacheHit),
+            modelTtftMs: try c.decode(Int.self, forKey: .modelTtftMs),
+            modelTotalMs: try c.decode(Int.self, forKey: .modelTotalMs),
+            fenceMs: try c.decode(Int.self, forKey: .fenceMs),
+            sendWireMs: try c.decode(Int.self, forKey: .sendWireMs),
+            totalMs: try c.decode(Int.self, forKey: .totalMs),
+            bottleneck: try c.decode(PerfStage.self, forKey: .bottleneck),
+            modelMode: try c.contains(.modelMode) ? c.decode(ModelMode.self, forKey: .modelMode) : nil,
+            effort: try c.contains(.effort) ? c.decode(ReasoningEffort.self, forKey: .effort) : nil,
+            fallbackUsed: try c.decode(Bool.self, forKey: .fallbackUsed),
+            errorCode: try c.contains(.errorCode) ? c.decode(IPCErrorCode.self, forKey: .errorCode) : nil,
+            presetId: try c.contains(.presetId) ? c.decode(String.self, forKey: .presetId) : nil,
+            modelName: try c.contains(.modelName) ? c.decode(String.self, forKey: .modelName) : nil,
+            promptTokens: try c.defaulted(.promptTokens, 0),
+            cachedTokens: try c.defaulted(.cachedTokens, 0),
+            completionTokens: try c.defaulted(.completionTokens, 0),
+            estimatedCostUsd: try c.defaulted(.estimatedCostUsd, 0)
+        )
+    }
 }
 
 struct PerfStageSummary: Codable, Equatable, Identifiable, Sendable {
@@ -894,6 +955,35 @@ struct PerfStageSummary: Codable, Equatable, Identifiable, Sendable {
     var id: String { stage.rawValue }
 
     private enum CodingKeys: String, CodingKey { case stage, p50Ms, p95Ms, avgMs, sharePercent, bottleneckCount }
+}
+
+struct TokenMetricsSummary: Codable, Equatable, Sendable {
+    var promptTokens: Int = 0
+    var cachedTokens: Int = 0
+    var completionTokens: Int = 0
+    var kvCacheHitRate: Int = 0
+    var estimatedCostUsd: Double = 0
+}
+
+struct PresetPerfSummary: Codable, Equatable, Identifiable, Sendable {
+    var presetId: String
+    var modelName: String
+    var mode: ModelMode? = nil
+    var turns: Int
+    var p50TotalMs: Int
+    var p95TotalMs: Int
+    var p50TtftMs: Int
+    var promptTokens: Int
+    var cachedTokens: Int
+    var completionTokens: Int
+    var kvCacheHitRate: Int
+    var estimatedCostUsd: Double
+    var id: String { presetId }
+
+    private enum CodingKeys: String, CodingKey {
+        case presetId, modelName, mode, turns, p50TotalMs, p95TotalMs, p50TtftMs
+        case promptTokens, cachedTokens, completionTokens, kvCacheHitRate, estimatedCostUsd
+    }
 }
 
 struct SystemMetricsResult: Codable, Equatable, Sendable {
@@ -909,9 +999,42 @@ struct SystemMetricsResult: Codable, Equatable, Sendable {
     var slowThresholdMs: Int
     var promptCacheHitCount: Int
     var total: Total
+    var tokens: TokenMetricsSummary = TokenMetricsSummary()
     var primaryBottleneck: PerfStage? = nil
     var stages: [PerfStageSummary]
+    var byPreset: [PresetPerfSummary] = []
     var recent: [TurnPerfSample]
+
+    private enum CodingKeys: String, CodingKey {
+        case windowHours, sampleCount, slowCount, slowThresholdMs, promptCacheHitCount
+        case total, tokens, primaryBottleneck, stages, byPreset, recent
+    }
+
+    init(windowHours: Int, sampleCount: Int, slowCount: Int, slowThresholdMs: Int, promptCacheHitCount: Int,
+         total: Total, tokens: TokenMetricsSummary = TokenMetricsSummary(), primaryBottleneck: PerfStage? = nil,
+         stages: [PerfStageSummary], byPreset: [PresetPerfSummary] = [], recent: [TurnPerfSample]) {
+        self.windowHours = windowHours; self.sampleCount = sampleCount; self.slowCount = slowCount
+        self.slowThresholdMs = slowThresholdMs; self.promptCacheHitCount = promptCacheHitCount
+        self.total = total; self.tokens = tokens; self.primaryBottleneck = primaryBottleneck
+        self.stages = stages; self.byPreset = byPreset; self.recent = recent
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            windowHours: try c.decode(Int.self, forKey: .windowHours),
+            sampleCount: try c.decode(Int.self, forKey: .sampleCount),
+            slowCount: try c.decode(Int.self, forKey: .slowCount),
+            slowThresholdMs: try c.decode(Int.self, forKey: .slowThresholdMs),
+            promptCacheHitCount: try c.decode(Int.self, forKey: .promptCacheHitCount),
+            total: try c.decode(Total.self, forKey: .total),
+            tokens: try c.defaulted(.tokens, TokenMetricsSummary()),
+            primaryBottleneck: try c.contains(.primaryBottleneck) ? c.decode(PerfStage.self, forKey: .primaryBottleneck) : nil,
+            stages: try c.decode([PerfStageSummary].self, forKey: .stages),
+            byPreset: try c.defaulted(.byPreset, []),
+            recent: try c.decode([TurnPerfSample].self, forKey: .recent)
+        )
+    }
 }
 
 struct HealthCheckStep: Codable, Equatable, Identifiable, Sendable {
