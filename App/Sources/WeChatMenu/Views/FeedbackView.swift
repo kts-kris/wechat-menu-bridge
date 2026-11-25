@@ -66,6 +66,16 @@ struct DiagnosticSnapshot: Equatable {
     }
 
     struct PerfSummary: Equatable {
+        struct PresetRow: Equatable {
+            let mode: ModelMode?
+            let turns: Int
+            let p50TotalMs: Int
+            let p50TtftMs: Int
+            let kvCacheHitRate: Int
+            let totalTokens: Int
+            let estimatedCostUsd: Double
+        }
+
         let windowHours: Int
         let sampleCount: Int
         let slowCount: Int
@@ -74,11 +84,20 @@ struct DiagnosticSnapshot: Equatable {
         let maxMs: Int
         let primaryBottleneck: PerfStage?
         let stageShares: [(stage: PerfStage, sharePercent: Int, p50Ms: Int, p95Ms: Int)]
+        var promptTokens: Int = 0
+        var cachedTokens: Int = 0
+        var completionTokens: Int = 0
+        var kvCacheHitRate: Int = 0
+        var estimatedCostUsd: Double = 0
+        var presets: [PresetRow] = []
 
         static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.windowHours == rhs.windowHours && lhs.sampleCount == rhs.sampleCount && lhs.slowCount == rhs.slowCount
                 && lhs.p50Ms == rhs.p50Ms && lhs.p95Ms == rhs.p95Ms && lhs.maxMs == rhs.maxMs
                 && lhs.primaryBottleneck == rhs.primaryBottleneck
+                && lhs.promptTokens == rhs.promptTokens && lhs.cachedTokens == rhs.cachedTokens
+                && lhs.completionTokens == rhs.completionTokens && lhs.kvCacheHitRate == rhs.kvCacheHitRate
+                && lhs.estimatedCostUsd == rhs.estimatedCostUsd && lhs.presets == rhs.presets
                 && lhs.stageShares.count == rhs.stageShares.count
                 && zip(lhs.stageShares, rhs.stageShares).allSatisfy {
                     $0.stage == $1.stage && $0.sharePercent == $1.sharePercent && $0.p50Ms == $1.p50Ms && $0.p95Ms == $1.p95Ms
@@ -114,7 +133,15 @@ struct DiagnosticSnapshot: Equatable {
                 windowHours: m.windowHours, sampleCount: m.sampleCount, slowCount: m.slowCount,
                 p50Ms: m.total.p50Ms, p95Ms: m.total.p95Ms, maxMs: m.total.maxMs,
                 primaryBottleneck: m.primaryBottleneck,
-                stageShares: m.stages.map { ($0.stage, $0.sharePercent, $0.p50Ms, $0.p95Ms) }
+                stageShares: m.stages.map { ($0.stage, $0.sharePercent, $0.p50Ms, $0.p95Ms) },
+                promptTokens: m.tokens.promptTokens, cachedTokens: m.tokens.cachedTokens,
+                completionTokens: m.tokens.completionTokens, kvCacheHitRate: m.tokens.kvCacheHitRate,
+                estimatedCostUsd: m.tokens.estimatedCostUsd,
+                presets: m.byPreset.map {
+                    .init(mode: $0.mode, turns: $0.turns, p50TotalMs: $0.p50TotalMs, p50TtftMs: $0.p50TtftMs,
+                          kvCacheHitRate: $0.kvCacheHitRate, totalTokens: $0.promptTokens + $0.completionTokens,
+                          estimatedCostUsd: $0.estimatedCostUsd)
+                }
             )
         }
         return Self(backendReady: workspace.runtime.ready, globalPhase: workspace.runtime.globalPhase,
@@ -234,6 +261,15 @@ enum DiagnosticBundleBuilder {
             }
             for item in perf.stageShares {
                 out.append("- \(item.stage.title)：占比 \(item.sharePercent)% · P50 \(item.p50Ms)ms · P95 \(item.p95Ms)ms")
+            }
+            if perf.promptTokens > 0 || perf.completionTokens > 0 {
+                let costPart = perf.estimatedCostUsd > 0 ? " · 估算费用 \(PerfFormat.costUsd(perf.estimatedCostUsd))" : ""
+                out.append("- Token 用量：输入 \(perf.promptTokens)（KV 缓存命中 \(perf.cachedTokens) / \(perf.kvCacheHitRate)%）· 输出 \(perf.completionTokens)\(costPart)")
+            }
+            for (idx, preset) in perf.presets.enumerated() {
+                let modeLabel = preset.mode?.rawValue ?? "unknown"
+                let costPart = preset.estimatedCostUsd > 0 ? " · \(PerfFormat.costUsd(preset.estimatedCostUsd))" : ""
+                out.append("- 预设 #\(idx + 1)（\(modeLabel)）：\(preset.turns) 轮 · 首包 P50 \(preset.p50TtftMs)ms · 总耗 P50 \(preset.p50TotalMs)ms · KV \(preset.kvCacheHitRate)% · Token \(preset.totalTokens)\(costPart)")
             }
         }
         let recent = logLines.suffix(logLineLimit)

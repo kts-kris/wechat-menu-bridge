@@ -251,6 +251,18 @@ enum PerfFormat {
         if ms >= 1000 { return String(format: "%.2fs", Double(ms) / 1000.0) }
         return "\(ms)ms"
     }
+
+    static func tokens(_ count: Int) -> String {
+        if count >= 1_000_000 { return String(format: "%.2fM", Double(count) / 1_000_000.0) }
+        if count >= 1000 { return String(format: "%.1fk", Double(count) / 1000.0) }
+        return "\(count)"
+    }
+
+    static func costUsd(_ usd: Double) -> String {
+        guard usd > 0 else { return "—" }
+        if usd < 0.01 { return String(format: "$%.4f", usd) }
+        return String(format: "$%.3f", usd)
+    }
 }
 
 struct PerformanceMonitorSection: View {
@@ -278,8 +290,14 @@ struct PerformanceMonitorSection: View {
         Section {
             if let data = metrics, data.sampleCount > 0 {
                 kpiStrip(data)
+                if data.tokens.promptTokens > 0 || data.tokens.completionTokens > 0 || !data.byPreset.isEmpty {
+                    tokenStrip(data)
+                }
                 stackedWaterfall(data)
                 stageBreakdown(data)
+                if !data.byPreset.isEmpty {
+                    presetComparison(data)
+                }
                 recentDisclosure(data)
             } else {
                 Text("暂无已完成的回复回合统计。开启任一会话的拟稿或自动回复后，这里将长期记录 6 段耗时与瓶颈归因。")
@@ -341,6 +359,62 @@ struct PerformanceMonitorSection: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 8)
+    }
+
+    private func tokenStrip(_ data: SystemMetricsResult) -> some View {
+        let t = data.tokens
+        return HStack(spacing: 0) {
+            kpi("输入 Token", PerfFormat.tokens(t.promptTokens), tint: .primary)
+            Divider().frame(height: 28)
+            kpi("KV 缓存命中", t.promptTokens > 0 ? "\(t.kvCacheHitRate)% (省 \(PerfFormat.tokens(t.cachedTokens)))" : "—", tint: t.kvCacheHitRate >= 50 ? .teal : .secondary)
+            Divider().frame(height: 28)
+            kpi("输出 Token", PerfFormat.tokens(t.completionTokens), tint: .primary)
+            Divider().frame(height: 28)
+            kpi("估算费用", t.estimatedCostUsd > 0 ? PerfFormat.costUsd(t.estimatedCostUsd) : "免费 / 未设单价", tint: t.estimatedCostUsd > 0 ? .blue : .secondary)
+        }
+        .padding(.vertical, 2)
+        .accessibilityIdentifier("perf-token-strip")
+    }
+
+    private func presetComparison(_ data: SystemMetricsResult) -> some View {
+        let fastestMs = data.byPreset.count >= 2 ? data.byPreset.map(\.p50TotalMs).min() : nil
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("多模型预设横向对比").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Text("共 \(data.byPreset.count) 个预设").font(.caption2).foregroundStyle(.secondary)
+            }
+            ForEach(data.byPreset) { item in
+                let displayName = settings.saved.preset(item.presetId)?.name ?? item.modelName
+                let isFastest = fastestMs != nil && item.p50TotalMs == fastestMs
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(displayName).font(.caption.weight(.medium)).lineLimit(1)
+                        if let mode = item.mode {
+                            StatusPill(text: mode == .cloud ? "云端" : "本机", tone: mode == .cloud ? .neutral : .active)
+                        }
+                        if isFastest { StatusPill(text: "最快", tone: .active) }
+                        Spacer()
+                        Text("\(item.turns) 轮").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        Text("P50 \(PerfFormat.duration(item.p50TotalMs))").font(.caption.weight(.semibold).monospacedDigit())
+                    }
+                    HStack(spacing: 8) {
+                        Text("首包 \(PerfFormat.duration(item.p50TtftMs)) · P95 \(PerfFormat.duration(item.p95TotalMs))")
+                        Text("·")
+                        Text("KV \(item.kvCacheHitRate)%")
+                        Text("·")
+                        Text("Token \(PerfFormat.tokens(item.promptTokens + item.completionTokens))")
+                        Spacer()
+                        Text(item.mode == .local ? "免费" : PerfFormat.costUsd(item.estimatedCostUsd))
+                            .foregroundStyle(item.estimatedCostUsd > 0 ? Color.blue : Color.secondary)
+                    }
+                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 2)
+                if item.id != data.byPreset.last?.id { Divider() }
+            }
+        }
+        .accessibilityIdentifier("perf-preset-comparison")
     }
 
     private func stackedWaterfall(_ data: SystemMetricsResult) -> some View {
@@ -410,7 +484,10 @@ struct PerformanceMonitorSection: View {
                                 .font(.caption.weight(.semibold).monospacedDigit())
                                 .foregroundStyle(isSlow ? Color.red : Color.primary)
                         }
-                        Text("入站 \(sample.ingestMs) · 防抖 \(sample.debounceMs) · 提示词 \(sample.promptMs)\(sample.promptCacheHit ? "(缓存)" : "") · 首包 \(sample.modelTtftMs) · 生成 \(sample.modelGenMs) · 发信 \(sample.sendTotalMs)ms（校验 \(sample.fenceMs)+提交 \(sample.sendWireMs)）\(sample.effort.map { " · effort=\($0.rawValue)" } ?? "")")
+                        let tokenPart = (sample.promptTokens > 0 || sample.completionTokens > 0)
+                            ? " · Token 入 \(PerfFormat.tokens(sample.promptTokens))(KV \(sample.kvCacheHitRate)%) / 出 \(PerfFormat.tokens(sample.completionTokens))" + (sample.estimatedCostUsd > 0 ? " · \(PerfFormat.costUsd(sample.estimatedCostUsd))" : "")
+                            : ""
+                        Text("入站 \(sample.ingestMs) · 防抖 \(sample.debounceMs) · 提示词 \(sample.promptMs)\(sample.promptCacheHit ? "(缓存)" : "") · 首包 \(sample.modelTtftMs) · 生成 \(sample.modelGenMs) · 发信 \(sample.sendTotalMs)ms（校验 \(sample.fenceMs)+提交 \(sample.sendWireMs)）\(sample.effort.map { " · effort=\($0.rawValue)" } ?? "")\(tokenPart)")
                             .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }

@@ -13,6 +13,9 @@ struct PresetForm: Equatable, Identifiable {
     var maxTokens: Int
     var temperature: Double
     var reasoningEffort: ReasoningEffort?
+    var inputPriceText: String
+    var cachedInputPriceText: String
+    var outputPriceText: String
 
     init() {
         id = "preset-\(UUID().uuidString.lowercased())"
@@ -24,6 +27,9 @@ struct PresetForm: Equatable, Identifiable {
         maxTokens = 320
         temperature = 0.35
         reasoningEffort = nil
+        inputPriceText = ""
+        cachedInputPriceText = ""
+        outputPriceText = ""
     }
 
     init(_ preset: ModelPreset) {
@@ -36,6 +42,21 @@ struct PresetForm: Equatable, Identifiable {
         maxTokens = preset.maxTokens
         temperature = preset.temperature
         reasoningEffort = preset.reasoningEffort
+        inputPriceText = Self.formatPrice(preset.inputPricePerMillion)
+        cachedInputPriceText = Self.formatPrice(preset.cachedInputPricePerMillion)
+        outputPriceText = Self.formatPrice(preset.outputPricePerMillion)
+    }
+
+    private static func formatPrice(_ value: Double?) -> String {
+        guard let value else { return "" }
+        return String(format: "%g", value)
+    }
+
+    private static func parsePrice(_ raw: String) -> (value: Double?, valid: Bool) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return (nil, true) }
+        guard let num = Double(trimmed), num.isFinite, (0...10_000).contains(num) else { return (nil, false) }
+        return (num, true)
     }
 
     // 语音转写端点按对应的 chat 端点复用同一套地址校验。
@@ -59,13 +80,24 @@ struct PresetForm: Equatable, Identifiable {
         }
         if maxTokens <= 0 { result.append("最大 Token 必须大于 0。") }
         if !(0...2).contains(temperature) { result.append("温度需在 0 到 2 之间。") }
+        if mode == .cloud {
+            if !Self.parsePrice(inputPriceText).valid || !Self.parsePrice(cachedInputPriceText).valid || !Self.parsePrice(outputPriceText).valid {
+                result.append("单价需为 0 到 10000 之间的数字（留空表示不估算费用）。")
+            }
+        }
         return result
     }
 
     func build() -> ModelPreset {
-        ModelPreset(id: id, name: name.trimmingCharacters(in: .whitespacesAndNewlines), mode: mode, kind: kind,
-                    url: endpoint ?? url, modelName: modelName, maxTokens: maxTokens, temperature: temperature,
-                    reasoningEffort: kind == .chat ? reasoningEffort : nil)
+        let isCloud = mode == .cloud
+        return ModelPreset(
+            id: id, name: name.trimmingCharacters(in: .whitespacesAndNewlines), mode: mode, kind: kind,
+            url: endpoint ?? url, modelName: modelName, maxTokens: maxTokens, temperature: temperature,
+            reasoningEffort: kind == .chat ? reasoningEffort : nil,
+            inputPricePerMillion: isCloud ? Self.parsePrice(inputPriceText).value : nil,
+            cachedInputPricePerMillion: isCloud ? Self.parsePrice(cachedInputPriceText).value : nil,
+            outputPricePerMillion: isCloud ? Self.parsePrice(outputPriceText).value : nil
+        )
     }
 }
 
@@ -542,11 +574,13 @@ struct PresetEditor: View {
     @State private var busy = false
     @State private var message: String?
     @State private var fault: String?
+    @State private var showPricing: Bool
 
     init(workspace: V2Workspace, initial: PresetForm, dismiss: @escaping () -> Void) {
         self.workspace = workspace
         self.dismiss = dismiss
         _form = State(initialValue: initial)
+        _showPricing = State(initialValue: !initial.inputPriceText.isEmpty || !initial.cachedInputPriceText.isEmpty || !initial.outputPriceText.isEmpty)
     }
 
     var body: some View {
@@ -579,7 +613,10 @@ struct PresetEditor: View {
                 }
                 .accessibilityIdentifier("preset-reasoning-effort")
             }
-            if form.mode == .cloud { keySection }
+            if form.mode == .cloud {
+                keySection
+                pricingSection
+            }
             if let issue = form.issues.first { InlineNotice(text: issue, tone: .warning) }
             if let message { InlineNotice(text: message, tone: .active) }
             if let fault { InlineNotice(text: v2Explanation(fault), tone: .critical) }
@@ -597,6 +634,21 @@ struct PresetEditor: View {
         }
         .padding(20)
         .frame(width: 520)
+    }
+
+    private var pricingSection: some View {
+        DisclosureGroup("可选：费用估算单价（美元 / 百万 Token）", isExpanded: $showPricing) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    TextField("输入，如 1.25", text: $form.inputPriceText).textFieldStyle(.roundedBorder)
+                    TextField("缓存输入，如 0.125", text: $form.cachedInputPriceText).textFieldStyle(.roundedBorder)
+                    TextField("输出，如 10", text: $form.outputPriceText).textFieldStyle(.roundedBorder)
+                }
+                Text("仅用于本机概览页费用估算，留空不计费；本机模型固定按免费统计。").font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.top, 4)
+        }
+        .accessibilityIdentifier("preset-pricing-disclosure")
     }
 
     private var keySection: some View {

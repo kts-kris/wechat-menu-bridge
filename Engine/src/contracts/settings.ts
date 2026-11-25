@@ -20,6 +20,8 @@ function modelEndpoint(value: string, kind: z.infer<typeof modelKindSchema>) {
   return base + (kind === 'stt' ? '/audio/transcriptions' : '/chat/completions');
 }
 
+const pricePerMillion = z.number().finite().min(0).max(10_000);
+
 export const modelPresetSchema = z.strictObject({
   id: identifierSchema,
   name: z.string().min(1),
@@ -30,6 +32,9 @@ export const modelPresetSchema = z.strictObject({
   reasoningEffort: z.enum(['default', 'low', 'medium', 'high', 'max']).optional(),
   maxTokens: positiveInt.default(320),
   temperature: z.number().min(0).max(2).default(0.35),
+  inputPricePerMillion: pricePerMillion.optional(),
+  cachedInputPricePerMillion: pricePerMillion.optional(),
+  outputPricePerMillion: pricePerMillion.optional(),
 }).transform(preset => ({ ...preset, url: modelEndpoint(preset.url, preset.kind) }));
 
 const clockTimeSchema = z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, 'Expected HH:mm');

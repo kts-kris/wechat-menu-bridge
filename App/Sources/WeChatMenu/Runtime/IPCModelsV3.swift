@@ -167,15 +167,25 @@ struct ModelPreset: Codable, Equatable, Identifiable, Sendable {
     var temperature = 0.35
     // nil 时编码省略，既有 settings.json 不产生差异。
     var reasoningEffort: ReasoningEffort? = nil
+    var inputPricePerMillion: Double? = nil
+    var cachedInputPricePerMillion: Double? = nil
+    var outputPricePerMillion: Double? = nil
 
-    private enum CodingKeys: String, CodingKey { case id, name, mode, kind, url, modelName, maxTokens, temperature, reasoningEffort }
+    private enum CodingKeys: String, CodingKey {
+        case id, name, mode, kind, url, modelName, maxTokens, temperature, reasoningEffort
+        case inputPricePerMillion, cachedInputPricePerMillion, outputPricePerMillion
+    }
 
     init(id: String, name: String, mode: ModelMode, kind: ModelKind, url: String, modelName: String,
-         maxTokens: Int = 320, temperature: Double = 0.35, reasoningEffort: ReasoningEffort? = nil) {
+         maxTokens: Int = 320, temperature: Double = 0.35, reasoningEffort: ReasoningEffort? = nil,
+         inputPricePerMillion: Double? = nil, cachedInputPricePerMillion: Double? = nil, outputPricePerMillion: Double? = nil) {
         self.id = id; self.name = name; self.mode = mode; self.kind = kind
         self.url = ModelEndpoint.canonical(url, kind: kind)
         self.modelName = modelName.trimmingCharacters(in: .whitespacesAndNewlines)
         self.maxTokens = maxTokens; self.temperature = temperature; self.reasoningEffort = reasoningEffort
+        self.inputPricePerMillion = inputPricePerMillion
+        self.cachedInputPricePerMillion = cachedInputPricePerMillion
+        self.outputPricePerMillion = outputPricePerMillion
     }
 
     init(from decoder: Decoder) throws {
@@ -184,7 +194,10 @@ struct ModelPreset: Codable, Equatable, Identifiable, Sendable {
                   mode: try c.decode(ModelMode.self, forKey: .mode), kind: try c.decode(ModelKind.self, forKey: .kind),
                   url: try c.decode(String.self, forKey: .url), modelName: try c.decode(String.self, forKey: .modelName),
                   maxTokens: try c.defaulted(.maxTokens, 320), temperature: try c.defaulted(.temperature, 0.35),
-                  reasoningEffort: try c.decodeIfPresent(ReasoningEffort.self, forKey: .reasoningEffort))
+                  reasoningEffort: try c.decodeIfPresent(ReasoningEffort.self, forKey: .reasoningEffort),
+                  inputPricePerMillion: try c.decodeIfPresent(Double.self, forKey: .inputPricePerMillion),
+                  cachedInputPricePerMillion: try c.decodeIfPresent(Double.self, forKey: .cachedInputPricePerMillion),
+                  outputPricePerMillion: try c.decodeIfPresent(Double.self, forKey: .outputPricePerMillion))
     }
 }
 
@@ -509,6 +522,9 @@ struct SettingsV2: Codable, Equatable, Sendable {
         for preset in models {
             guard Self.identifier(preset.id), !preset.name.isEmpty, !preset.modelName.isEmpty, preset.maxTokens > 0,
                   (0...2).contains(preset.temperature) else { throw invalid }
+            for price in [preset.inputPricePerMillion, preset.cachedInputPricePerMillion, preset.outputPricePerMillion].compactMap({ $0 }) {
+                guard price.isFinite, (0...10_000).contains(price) else { throw invalid }
+            }
             guard ModelEndpoint.isAddress(preset.url) else { throw BridgeFault("invalid-endpoint") }
         }
         let presets = [defaultModels.replyPresetId, defaultModels.fallbackReplyPresetId, defaultModels.pluginPresetId, defaultModels.memoryPresetId,
