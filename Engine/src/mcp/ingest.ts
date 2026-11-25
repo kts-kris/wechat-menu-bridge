@@ -104,6 +104,7 @@ export class AccountIngestScheduler {
   constructor(private readonly options: Options) {}
 
   get currentIdentity() { return this.identity ? identityKey(this.identity) : undefined; }
+  get boundIdentity(): RemoteIdentity | undefined { return this.identity; }
 
   bindIdentity(remote: RemoteIdentity) {
     if (remote.binding.account_id !== this.options.accountId ||

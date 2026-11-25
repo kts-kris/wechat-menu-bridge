@@ -26,12 +26,14 @@ export type BridgeEvents = { [K in PushTopic]: PushPayload<K> } & {
 };
 type StatusContributor = () => { plugins: Record<string, PluginRuntimeState>; activePluginCount: number; pendingProposalCount: number };
 type PromptProfileResolver = (policy: ConversationPolicy, mode: 'local' | 'cloud') => Promise<{ style?: string; memory?: string }>;
+type PromptCacheFingerprint = (policy: ConversationPolicy, mode: 'local' | 'cloud') => string;
 type Options = {
   settings?: SettingsV2;
   getMcpToken?: (url: string) => string | undefined | Promise<string | undefined>;
   getModelKey?: KeyProvider;
   createClient?: (url: string, token?: string) => XiaoheClient;
   assemblePrompt?: PromptProfileResolver;
+  promptCacheFingerprint?: PromptCacheFingerprint;
   statusContributor?: StatusContributor;
   onSettingsApplied?: (settings: SettingsV2, cloudApiKeys?: Record<string, string>) => void;
   onPauseAll?: (scope: 'sending_only' | 'all') => void;
@@ -82,7 +84,8 @@ export class BridgeOrchestrator {
   private listening = new Set<string>();
   private readonly mediaAbort = new Map<string, AbortController>();
   private readonly previewAbort = new Set<AbortController>();
-  private readonly promptCache = new Map<string, { at: number; task: Promise<{ style?: string; memory?: string }> }>();
+  private promptCacheEpoch = 0;
+  private readonly promptCache = new Map<string, { at: number; epoch: number; fingerprint?: string; task: Promise<{ style?: string; memory?: string }> }>();
   private readonly clock: ReturnType<typeof setInterval>;
   private runtimeError?: ErrorCode;
 
@@ -217,6 +220,7 @@ export class BridgeOrchestrator {
       workingTtlMs: this.settings.memory.workingTtlMinutes * 60_000, ...this.options.actorTiming,
       fence: () => connection.ingest.fence(id),
       capabilities: () => ({ nativeReply: this.capabilities.nativeReply, mentionSend: this.capabilities.mentionSend }),
+      fastReplyMode: () => this.settings.runtime.fastReplyMode,
       quietHours: () => this.settings.runtime.quietHours,
       quietHoursNow: this.options.quietHoursNow,
       onTrace: (stage, level, summary, code) => this.emitTrace(id, stage, level, summary, code),
@@ -266,9 +270,14 @@ export class BridgeOrchestrator {
   private assemblePromptCached(policy: ConversationPolicy, mode: 'local' | 'cloud'): Promise<{ style?: string; memory?: string; cacheHit?: boolean; promptMs?: number }> {
     if (!this.options.assemblePrompt) return Promise.resolve({ cacheHit: false, promptMs: 0 });
     const key = `${policy.conversationId}:${mode}`;
+    const epoch = this.promptCacheEpoch;
+    const fp = this.options.promptCacheFingerprint?.(policy, mode);
     const now = Date.now();
     const cached = this.promptCache.get(key);
-    if (cached && now - cached.at <= 3000) {
+    const hit = cached !== undefined && cached.epoch === epoch && (
+      fp !== undefined ? cached.fingerprint === fp : now - cached.at <= 30_000
+    );
+    if (hit) {
       return cached.task.then(value => ({ ...value, cacheHit: true, promptMs: 0 }));
     }
     const started = performance.now();
@@ -276,11 +285,18 @@ export class BridgeOrchestrator {
       if (this.promptCache.get(key)?.task === task) this.promptCache.delete(key);
       throw error;
     });
-    this.promptCache.set(key, { at: now, task });
+    if (this.promptCache.size >= 256 && !this.promptCache.has(key)) {
+      const oldest = this.promptCache.keys().next().value;
+      if (oldest !== undefined) this.promptCache.delete(oldest);
+    }
+    this.promptCache.set(key, { at: now, epoch, fingerprint: fp, task });
     return task.then(value => ({ ...value, cacheHit: false, promptMs: Math.max(0, Math.round(performance.now() - started)) }));
   }
 
-  invalidatePromptCache() { this.promptCache.clear(); }
+  invalidatePromptCache() {
+    this.promptCacheEpoch++;
+    this.promptCache.clear();
+  }
 
   private replyPreset(policy: ConversationPolicy) {
     const id = policy.replyPresetId ?? this.settings.defaultModels.replyPresetId;
@@ -360,7 +376,10 @@ export class BridgeOrchestrator {
       let enriched = input;
       let mediaStarted = false;
       try {
-        const remote = await connection.client.identify(event.accountId, controller.signal);
+        const bound = connection.ingest.boundIdentity;
+        const remote = bound && bound.binding.account_id === event.accountId && identityKey(bound) === input.identity
+          ? bound
+          : await connection.client.identify(event.accountId, controller.signal);
         if (identityKey(remote) !== input.identity) throw new BridgeError('wechat-changed');
         const scope = { ...remote.binding, conversation_id: id };
         const { replyPresetId, visionPresetId: explicitVisionPresetId, sttPresetId } = this.settings.defaultModels;
@@ -756,7 +775,7 @@ export class BridgeOrchestrator {
       }
       this.models.configure(next.models, next.runtime.maxConcurrentLlmCalls);
       this.settings = next;
-      this.promptCache.clear();
+      this.invalidatePromptCache();
       this.readOnly = new Set([...this.readOnly].filter(id => Object.hasOwn(next.conversations, id) && next.conversations[id]?.enabled));
       this.options.onSettingsApplied?.(next, cloudApiKeys);
     } finally { this.applying = false; }
