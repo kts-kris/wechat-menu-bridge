@@ -567,6 +567,18 @@ private struct ConversationDetail: View {
                     ForEach(settings.draft.models.filter { $0.kind == .chat }) { Text($0.name).tag(String?.some($0.id)) }
                 }
                 replyStyleToggles
+                Toggle(isOn: binding(\.ignoreQuietHours)) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("忽略全局勿扰时段")
+                        let qh = settings.draft.runtime.quietHours
+                        let summary = qh.enabled
+                            ? "当前全局勿扰：\(qh.start) – \(qh.end)（\(qh.action == .draftOnly ? "降级只拟稿" : "跳过本轮")）"
+                            : "全局勿扰未开启，可在「连接与设置」中配置"
+                        Text(summary).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .accessibilityIdentifier("conversation-ignore-quiet-hours")
                 LabeledContent("开启时载入上下文") {
                     Stepper(value: binding(\.backfillOnArmCount), in: 0...500, step: 5) {
                         Text("最近 \(policy.backfillOnArmCount) 条").monospacedDigit()

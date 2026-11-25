@@ -246,23 +246,26 @@ struct ConversationPolicy: Codable, Equatable, Identifiable, Sendable {
     // v2.2.0：优先引用原消息回复；群聊回复时 @ 提问成员。旧 settings.json 缺省为 false。
     var useNativeReply = false
     var mentionReplySender = false
+    // v2.3.0：豁免全局勿扰时段。旧 settings.json 缺省为 false。
+    var ignoreQuietHours = false
 
     var id: String { conversationId }
 
     private enum CodingKeys: String, CodingKey {
         case conversationId, label, type, enabled, replyMode, replyPresetId, groupTrigger, riskProfile
-        case backfillOnArmCount, memoryEnabled, pluginIds, useNativeReply, mentionReplySender
+        case backfillOnArmCount, memoryEnabled, pluginIds, useNativeReply, mentionReplySender, ignoreQuietHours
     }
 
     init(conversationId: String, label: String, type: ScopeType, enabled: Bool = false, replyMode: SessionReplyMode = .off,
          replyPresetId: String? = nil, groupTrigger: GroupTrigger = .mentionOnly, riskProfile: RiskProfile = RiskProfile(),
          backfillOnArmCount: Int = 10, memoryEnabled: Bool? = nil, pluginIds: [String] = [],
-         useNativeReply: Bool = false, mentionReplySender: Bool = false) {
+         useNativeReply: Bool = false, mentionReplySender: Bool = false, ignoreQuietHours: Bool = false) {
         self.conversationId = conversationId; self.label = label; self.type = type; self.enabled = enabled
         self.replyMode = replyMode; self.replyPresetId = replyPresetId; self.groupTrigger = groupTrigger
         self.riskProfile = riskProfile; self.backfillOnArmCount = backfillOnArmCount
         self.memoryEnabled = memoryEnabled ?? (type == .direct); self.pluginIds = pluginIds
         self.useNativeReply = useNativeReply; self.mentionReplySender = mentionReplySender
+        self.ignoreQuietHours = ignoreQuietHours
     }
 
     init(from decoder: Decoder) throws {
@@ -279,7 +282,8 @@ struct ConversationPolicy: Codable, Equatable, Identifiable, Sendable {
                   memoryEnabled: try c.defaulted(.memoryEnabled, type == .direct),
                   pluginIds: try c.defaulted(.pluginIds, []),
                   useNativeReply: try c.defaulted(.useNativeReply, false),
-                  mentionReplySender: try c.defaulted(.mentionReplySender, false))
+                  mentionReplySender: try c.defaulted(.mentionReplySender, false),
+                  ignoreQuietHours: try c.defaulted(.ignoreQuietHours, false))
     }
 }
 
@@ -342,15 +346,44 @@ struct SettingsV2: Codable, Equatable, Sendable {
         }
     }
 
+    struct QuietHours: Codable, Equatable, Sendable {
+        enum Action: String, Codable, CaseIterable, Equatable, Sendable {
+            case skipTurn = "skip_turn"
+            case draftOnly = "draft_only"
+        }
+
+        var enabled = false
+        var start = "23:00"
+        var end = "08:00"
+        var action: Action = .skipTurn
+
+        private enum CodingKeys: String, CodingKey { case enabled, start, end, action }
+        init(enabled: Bool = false, start: String = "23:00", end: String = "08:00", action: Action = .skipTurn) {
+            self.enabled = enabled; self.start = start; self.end = end; self.action = action
+        }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            enabled = try c.defaulted(.enabled, false)
+            start = try c.defaulted(.start, "23:00")
+            end = try c.defaulted(.end, "08:00")
+            action = try c.defaulted(.action, .skipTurn)
+        }
+
+        static func isValidClock(_ value: String) -> Bool {
+            value.range(of: #"^(?:[01]\d|2[0-3]):[0-5]\d$"#, options: .regularExpression) != nil
+        }
+    }
+
     struct Runtime: Codable, Equatable, Sendable {
         var autoResumeReadOnlyPlugins = false
         var pinnedConversationIds: [String] = []
         var approvedCloudPresetIds: [String] = []
         var maxConcurrentLlmCalls = 3
         var fastReplyMode = false
+        var quietHours = QuietHours()
 
         private enum CodingKeys: String, CodingKey {
-            case autoResumeReadOnlyPlugins, pinnedConversationIds, approvedCloudPresetIds, maxConcurrentLlmCalls, fastReplyMode
+            case autoResumeReadOnlyPlugins, pinnedConversationIds, approvedCloudPresetIds, maxConcurrentLlmCalls, fastReplyMode, quietHours
         }
         init() {}
         init(from decoder: Decoder) throws {
@@ -360,6 +393,7 @@ struct SettingsV2: Codable, Equatable, Sendable {
             approvedCloudPresetIds = try c.defaulted(.approvedCloudPresetIds, [])
             maxConcurrentLlmCalls = try c.defaulted(.maxConcurrentLlmCalls, 3)
             fastReplyMode = try c.defaulted(.fastReplyMode, false)
+            quietHours = try c.defaulted(.quietHours, QuietHours())
         }
     }
 
@@ -395,7 +429,9 @@ struct SettingsV2: Codable, Equatable, Sendable {
               memory.autoConsolidateIdleMinutes > 0, memory.autoConsolidateTurnThreshold > 0,
               runtime.pinnedConversationIds.count <= 4, runtime.pinnedConversationIds.allSatisfy(Self.identifier),
               runtime.approvedCloudPresetIds.allSatisfy(Self.identifier),
-              runtime.maxConcurrentLlmCalls > 0 else { throw invalid }
+              runtime.maxConcurrentLlmCalls > 0,
+              QuietHours.isValidClock(runtime.quietHours.start),
+              QuietHours.isValidClock(runtime.quietHours.end) else { throw invalid }
     }
 
     // 对齐 contracts.ts 的 id：1...2048 个字符且不含控制字符。

@@ -1738,4 +1738,39 @@ final class V2ViewTests: XCTestCase {
         XCTAssertFalse(ModelPreviewCard.defaultSample.contains("周末"))
         XCTAssertFalse(ModelPreviewCard.defaultSample.contains("吃饭"))
     }
+
+    // MARK: v2.3.0 勿扰时段（#21）
+
+    func testQuietHoursValidationBackwardCompatibilityAndRendering() throws {
+        XCTAssertTrue(SettingsV2.QuietHours.isValidClock("00:00"))
+        XCTAssertTrue(SettingsV2.QuietHours.isValidClock("23:59"))
+        XCTAssertFalse(SettingsV2.QuietHours.isValidClock("24:00"))
+        XCTAssertFalse(SettingsV2.QuietHours.isValidClock("9:00"))
+        XCTAssertFalse(SettingsV2.QuietHours.isValidClock("bad"))
+
+        // 旧版 settings.json 缺少 quietHours 和 ignoreQuietHours 时无损解码默认值。
+        let legacyJSON = #"{"schemaVersion":2,"xiaohe":{"mcpUrl":"","accountId":"","accountLabel":""},"models":[],"defaultModels":{},"conversations":{"wxid_a":{"conversationId":"wxid_a","label":"甲","type":"direct","enabled":true,"replyMode":"off"}},"memory":{},"runtime":{}}"#
+        let decoded = try IPCv3.decodeStrict(SettingsV2.self, from: Data(legacyJSON.utf8))
+        XCTAssertFalse(decoded.runtime.quietHours.enabled)
+        XCTAssertEqual(decoded.runtime.quietHours.start, "23:00")
+        XCTAssertEqual(decoded.runtime.quietHours.end, "08:00")
+        XCTAssertEqual(decoded.runtime.quietHours.action, .skipTurn)
+        XCTAssertEqual(decoded.conversations["wxid_a"]?.ignoreQuietHours, false)
+        XCTAssertNoThrow(try decoded.validate())
+
+        var invalid = decoded
+        invalid.runtime.quietHours.start = "25:99"
+        XCTAssertThrowsError(try invalid.validate())
+
+        let (workspace, _) = try makeWorkspace(connected: true)
+        seededSettings(workspace)
+        let size = CGSize(width: 620, height: 320)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            workspace.settings.draft.runtime.quietHours.enabled = false
+            let off = try snapshot(Form { QuietHoursCard(workspace: workspace) }.formStyle(.grouped), appearance: appearance, size: size)
+            workspace.settings.draft.runtime.quietHours.enabled = true
+            let on = try snapshot(Form { QuietHoursCard(workspace: workspace) }.formStyle(.grouped), appearance: appearance, size: size)
+            XCTAssertNotEqual(off, on, appearance.rawValue)
+        }
+    }
 }

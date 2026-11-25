@@ -125,6 +125,7 @@ struct V2SettingsView: View {
                     XiaoheConnectionCard(workspace: workspace)
                     HealthCheckCard(workspace: workspace)
                     DefaultModelsCard(workspace: workspace)
+                    QuietHoursCard(workspace: workspace)
                     ModelPresetsCard(workspace: workspace, editing: $editingPreset, pendingRemoval: $pendingPresetRemoval)
                     CloudAuthorizationCard(workspace: workspace)
                     ModelPreviewCard(workspace: workspace)
@@ -775,6 +776,70 @@ private struct DefaultModelsCard: View {
         Picker(title, selection: binding(path)) {
             Text(noneTitle).tag(String?.none)
             ForEach(presets) { Text($0.name).tag(String?.some($0.id)) }
+        }
+    }
+}
+
+// MARK: - 勿扰时段
+
+struct QuietHoursCard: View {
+    @ObservedObject var workspace: V2Workspace
+    @ObservedObject private var settings: SettingsStore
+
+    init(workspace: V2Workspace) {
+        self.workspace = workspace
+        settings = workspace.settings
+    }
+
+    private var quietHours: SettingsV2.QuietHours { settings.draft.runtime.quietHours }
+    private var invalidTime: Bool {
+        !SettingsV2.QuietHours.isValidClock(quietHours.start) || !SettingsV2.QuietHours.isValidClock(quietHours.end)
+    }
+    private var emptyWindow: Bool {
+        !invalidTime && quietHours.enabled && quietHours.start == quietHours.end
+    }
+
+    var body: some View {
+        Section {
+            Toggle(isOn: $settings.draft.runtime.quietHours.enabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("启用全局勿扰时段")
+                    Text("按本机时区生效，支持跨零点（如 23:00 至 08:00）；可在单个会话中单独豁免")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
+            .accessibilityIdentifier("quiet-hours-enabled")
+            if quietHours.enabled {
+                HStack(spacing: 12) {
+                    LabeledContent("开始") {
+                        TextField("23:00", text: $settings.draft.runtime.quietHours.start)
+                            .font(.callout.monospacedDigit())
+                            .frame(width: 72)
+                            .accessibilityIdentifier("quiet-hours-start")
+                    }
+                    LabeledContent("结束") {
+                        TextField("08:00", text: $settings.draft.runtime.quietHours.end)
+                            .font(.callout.monospacedDigit())
+                            .frame(width: 72)
+                            .accessibilityIdentifier("quiet-hours-end")
+                    }
+                }
+                if invalidTime {
+                    InlineNotice(text: "时间格式需为 24 小时制 HH:mm（例如 23:00、08:00）。", tone: .warning)
+                } else if emptyWindow {
+                    InlineNotice(text: "开始与结束时间相同，勿扰时段不会生效。", tone: .warning)
+                }
+                Picker("勿扰期处理", selection: $settings.draft.runtime.quietHours.action) {
+                    Text("跳过本轮（不调模型，省 Token）").tag(SettingsV2.QuietHours.Action.skipTurn)
+                    Text("降级为只拟稿（生成草稿不发信）").tag(SettingsV2.QuietHours.Action.draftOnly)
+                }
+                .accessibilityIdentifier("quiet-hours-action")
+            }
+        } header: {
+            Text("勿扰时段")
+        } footer: {
+            Text("只影响自动回复与拟稿；对方叫停锁与只读后链路插件不受影响。").font(.caption).foregroundStyle(.secondary)
         }
     }
 }
