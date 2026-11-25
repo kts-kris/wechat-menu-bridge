@@ -5,7 +5,7 @@ import {
   backfillProgressSchema, backfillRequestSchema, identifierSchema, scopeTypeSchema, timestampSchema, xiaoheCapabilitiesSchema,
 } from './events.ts';
 import { declarativePluginConfigSchema, pluginManifestSchema, pluginPermissionSchema, webhookPlatformSchema } from './plugins.ts';
-import { settingsV2Schema } from './settings.ts';
+import { conversationPolicySchema, quietHoursSchema, settingsV2Schema } from './settings.ts';
 
 export const IPC_VERSION = 3;
 export const MAX_FRAME_BYTES = 256 * 1024;
@@ -180,6 +180,21 @@ export const hotBundlesStatusSchema = z.strictObject({
   items: z.array(hotBundleItemSchema),
 });
 
+export const policyEvaluateStepSchema = z.strictObject({
+  stage: z.enum(['iron_rule', 'quiet_hours', 'keywords', 'risk_rules', 'verdict']),
+  title: z.string().max(120),
+  outcome: z.enum(['pass', 'hit', 'skip']),
+  detail: z.string().max(300),
+});
+export type PolicyEvaluateStep = z.infer<typeof policyEvaluateStepSchema>;
+
+export const policyEvaluateResultSchema = z.strictObject({
+  steps: z.array(policyEvaluateStepSchema),
+  finalAction: z.enum(['allow', 'skip_turn', 'draft_only', 'pause_session', 'lock_peer', 'identity']),
+  matchedRule: z.string().max(64).optional(),
+});
+export type PolicyEvaluateResult = z.infer<typeof policyEvaluateResultSchema>;
+
 export const rpcSchemas = {
   'system.status': { params: empty, result: status },
   'system.bundles': {
@@ -211,6 +226,16 @@ export const rpcSchemas = {
   'model.preview': {
     params: z.strictObject({ model: modelSchema, text: z.string().trim().min(1).max(400) }),
     result: z.strictObject({ action: z.enum(['reply', 'skip', 'manual', 'stop', 'identity']), text: z.string().optional() }),
+  },
+  'policy.evaluate': {
+    params: z.strictObject({
+      text: z.string().max(2000),
+      policy: conversationPolicySchema,
+      quietHours: quietHoursSchema.optional(),
+      mentionsSelf: z.boolean().default(false),
+      inQuietHours: z.boolean().optional(),
+    }),
+    result: policyEvaluateResultSchema,
   },
   'session.arm': {
     params: session.extend({

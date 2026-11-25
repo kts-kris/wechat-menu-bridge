@@ -188,6 +188,29 @@ struct ModelPreset: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+enum CustomizableRuleId: String, Codable, CaseIterable, Identifiable, Hashable, CodingKeyRepresentable, Sendable {
+    case credentials, finance, privacy, legal, health
+    case instructions, link, commitment, schedule, delegation
+    case sensitiveTopic = "sensitive-topic"
+    case numbers
+
+    var id: String { rawValue }
+}
+
+enum RuleOverrideAction: String, Codable, CaseIterable, Equatable, Sendable {
+    case inherit
+    case allow
+    case skipTurn = "skip_turn"
+    case draftOnly = "draft_only"
+    case pauseSession = "pause_session"
+}
+
+enum CustomBlockAction: String, Codable, CaseIterable, Equatable, Sendable {
+    case skipTurn = "skip_turn"
+    case draftOnly = "draft_only"
+    case pauseSession = "pause_session"
+}
+
 struct RiskProfile: Codable, Equatable, Sendable {
     enum Level: String, Codable, CaseIterable, Sendable { case recommended, strict, minimal }
     enum TurnAction: String, Codable, CaseIterable, Sendable { case skipTurn = "skip_turn", pauseSession = "pause_session" }
@@ -198,6 +221,10 @@ struct RiskProfile: Codable, Equatable, Sendable {
     var takeoverCooldownMinutes = 15
     private var strictLegacyRules: Bool
     private var level: Level?
+    // v2.3.0：按内置类目覆盖动作（12 类非铁律规则）与自定义必拦词。旧 settings.json 缺省为 {} / [] / pause_session。
+    var ruleOverrides: [CustomizableRuleId: RuleOverrideAction] = [:]
+    var customBlockKeywords: [String] = []
+    var customBlockAction: CustomBlockAction = .pauseSession
 
     // nil 表示旧版本的「保守规则只跳过本轮」，保留到用户主动切换。
     var selectedLevel: Level? {
@@ -208,13 +235,38 @@ struct RiskProfile: Codable, Equatable, Sendable {
         }
     }
 
-    private enum CodingKeys: String, CodingKey {
-        case busyChatAction, unparsedMediaAction, takeoverAction, takeoverCooldownMinutes, strictLegacyRules, level
+    private static let highRiskRules: Set<CustomizableRuleId> = [.credentials, .finance, .privacy, .legal, .health]
+
+    func defaultAction(for rule: CustomizableRuleId) -> RuleOverrideAction {
+        switch selectedLevel {
+        case .strict: return .pauseSession
+        case .recommended: return Self.highRiskRules.contains(rule) ? .skipTurn : .allow
+        case .minimal: return .allow
+        case nil: return .skipTurn
+        }
     }
 
-    init(level: Level? = .recommended) {
+    func effectiveAction(for rule: CustomizableRuleId) -> RuleOverrideAction {
+        if let override = ruleOverrides[rule], override != .inherit { return override }
+        return defaultAction(for: rule)
+    }
+
+    var activeOverrideCount: Int {
+        ruleOverrides.values.filter { $0 != .inherit }.count
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case busyChatAction, unparsedMediaAction, takeoverAction, takeoverCooldownMinutes, strictLegacyRules, level
+        case ruleOverrides, customBlockKeywords, customBlockAction
+    }
+
+    init(level: Level? = .recommended, ruleOverrides: [CustomizableRuleId: RuleOverrideAction] = [:],
+         customBlockKeywords: [String] = [], customBlockAction: CustomBlockAction = .pauseSession) {
         self.level = level
         strictLegacyRules = level == .strict
+        self.ruleOverrides = ruleOverrides
+        self.customBlockKeywords = customBlockKeywords
+        self.customBlockAction = customBlockAction
     }
 
     init(from decoder: Decoder) throws {
@@ -225,6 +277,9 @@ struct RiskProfile: Codable, Equatable, Sendable {
         takeoverCooldownMinutes = try c.defaulted(.takeoverCooldownMinutes, 15)
         strictLegacyRules = try c.defaulted(.strictLegacyRules, false)
         level = c.contains(.level) ? try c.decode(Level.self, forKey: .level) : nil
+        ruleOverrides = try c.defaulted(.ruleOverrides, [:])
+        customBlockKeywords = try c.defaulted(.customBlockKeywords, [])
+        customBlockAction = try c.defaulted(.customBlockAction, .pauseSession)
     }
 }
 
@@ -466,7 +521,9 @@ struct SettingsV2: Codable, Equatable, Sendable {
                   policy.triggerKeywords.count <= ConversationPolicy.maxKeywordCount,
                   policy.triggerKeywords.allSatisfy(ConversationPolicy.isValidKeyword),
                   policy.ignoreKeywords.count <= ConversationPolicy.maxKeywordCount,
-                  policy.ignoreKeywords.allSatisfy(ConversationPolicy.isValidKeyword) else { throw invalid }
+                  policy.ignoreKeywords.allSatisfy(ConversationPolicy.isValidKeyword),
+                  policy.riskProfile.customBlockKeywords.count <= ConversationPolicy.maxKeywordCount,
+                  policy.riskProfile.customBlockKeywords.allSatisfy(ConversationPolicy.isValidKeyword) else { throw invalid }
         }
         guard (4...64).contains(memory.workingMaxMessages), (3...240).contains(memory.workingTtlMinutes),
               memory.autoConsolidateIdleMinutes > 0, memory.autoConsolidateTurnThreshold > 0,
@@ -1031,6 +1088,38 @@ struct ModelPreviewResult: Codable, Equatable, Sendable {
     var text: String? = nil
 }
 
+struct PolicyEvaluateStep: Codable, Equatable, Identifiable, Sendable {
+    enum Stage: String, Codable, CaseIterable, Sendable {
+        case ironRule = "iron_rule"
+        case quietHours = "quiet_hours"
+        case keywords
+        case riskRules = "risk_rules"
+        case verdict
+    }
+    enum Outcome: String, Codable, CaseIterable, Sendable { case pass, hit, skip }
+    var stage: Stage
+    var title: String
+    var outcome: Outcome
+    var detail: String
+    var id: String { stage.rawValue }
+
+    private enum CodingKeys: String, CodingKey { case stage, title, outcome, detail }
+}
+
+struct PolicyEvaluateResult: Codable, Equatable, Sendable {
+    enum FinalAction: String, Codable, CaseIterable, Sendable {
+        case allow
+        case skipTurn = "skip_turn"
+        case draftOnly = "draft_only"
+        case pauseSession = "pause_session"
+        case lockPeer = "lock_peer"
+        case identity
+    }
+    var steps: [PolicyEvaluateStep]
+    var finalAction: FinalAction
+    var matchedRule: String? = nil
+}
+
 struct BackfillJob: Codable, Equatable, Sendable { var jobId: String }
 struct SessionTraceList: Codable, Equatable, Sendable { var items: [SessionTraceEntry] }
 struct PluginRunStart: Codable, Equatable, Sendable { var runId: String }
@@ -1175,7 +1264,7 @@ enum RPCMethod: String, Codable, CaseIterable, Sendable {
     case systemBundles = "system.bundles"
     case xiaoheAccounts = "xiaohe.accounts", xiaoheConversations = "xiaohe.conversations"
     case xiaoheGroupMembers = "xiaohe.groupMembers", xiaoheCapabilities = "xiaohe.capabilities"
-    case settingsApply = "settings.apply", modelPreview = "model.preview"
+    case settingsApply = "settings.apply", modelPreview = "model.preview", policyEvaluate = "policy.evaluate"
     case sessionArm = "session.arm", sessionPause = "session.pause", sessionSendOneShot = "session.sendOneShot"
     case sessionRefreshReceipt = "session.refreshReceipt", sessionRecover = "session.recover", sessionBackfill = "session.backfill"
     case sessionTraces = "session.traces", sessionResumeCooldown = "session.resumeCooldown"
@@ -1266,6 +1355,13 @@ enum RPCParams {
         var cloudApiKeys: [String: String]? = nil
     }
     struct Preview: Encodable { let model: PreviewModel; let text: String }
+    struct PolicyEvaluate: Encodable {
+        let text: String
+        let policy: ConversationPolicy
+        var quietHours: SettingsV2.QuietHours? = nil
+        var mentionsSelf: Bool = false
+        var inQuietHours: Bool? = nil
+    }
     struct Arm: Encodable {
         let conversationId: String
         let replyMode: ArmReplyMode

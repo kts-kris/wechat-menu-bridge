@@ -1809,4 +1809,56 @@ final class V2ViewTests: XCTestCase {
             XCTAssertNotEqual(empty, filled, appearance.rawValue)
         }
     }
+
+    // MARK: v2.3.0 可视化风控规则管理中心与本地判定链模拟器（#23）
+
+    func testRuleCenterAndSimulatorRenderInLightAndDark() throws {
+        XCTAssertEqual(CustomizableRuleId.allCases.count, 12)
+        for rule in CustomizableRuleId.allCases {
+            XCTAssertFalse(rule.title.isEmpty)
+            XCTAssertFalse(rule.summary.isEmpty)
+        }
+
+        let (workspace, _) = try makeWorkspace(connected: true)
+        seededSettings(workspace)
+        var profile = RiskProfile(level: .recommended)
+        profile.ruleOverrides = [.schedule: .draftOnly, .finance: .pauseSession]
+        profile.customBlockKeywords = ["报价", "生产事故"]
+        profile.customBlockAction = .draftOnly
+        let policy = ConversationPolicy(
+            conversationId: "g@chatroom", label: "工作群", type: .group, enabled: true,
+            riskProfile: profile, triggerKeywords: ["上线"], ignoreKeywords: ["收到"]
+        )
+        let sampleResult = PolicyEvaluateResult(
+            steps: [
+                .init(stage: .ironRule, title: "① 安全铁律", outcome: .pass, detail: "未命中退订锁或人身安全铁律"),
+                .init(stage: .quietHours, title: "② 勿扰时段", outcome: .pass, detail: "当前不在勿扰时段"),
+                .init(stage: .keywords, title: "③ 触发与忽略词", outcome: .pass, detail: "群聊命中触发白名单词"),
+                .init(stage: .riskRules, title: "④ 内置与自定义风控", outcome: .hit, detail: "入站规则：时间或见面约定 → 仅生成草稿（不自动发送）"),
+                .init(stage: .verdict, title: "⑤ 最终判定", outcome: .hit, detail: "仅生成草稿（不自动发送）"),
+            ],
+            finalAction: .draftOnly,
+            matchedRule: "schedule"
+        )
+
+        let view = Form {
+            Section("规则管理与试测") {
+                RuleManagementSection(
+                    riskProfile: profile, expanded: true,
+                    onSetOverride: { _, _ in }, onResetOverrides: {},
+                    onUpdateCustomBlockKeywords: { _ in }, onUpdateCustomBlockAction: { _ in }
+                )
+                RuleSimulatorSection(
+                    workspace: workspace, policy: policy, quietHours: workspace.settings.draft.runtime.quietHours,
+                    expanded: true, initialText: "周末一起吃饭吗？", initialResult: sampleResult
+                )
+            }
+        }.formStyle(.grouped)
+
+        let size = CGSize(width: 680, height: 1400)
+        let light = try snapshot(view, appearance: .aqua, size: size)
+        let dark = try snapshot(view, appearance: .darkAqua, size: size)
+        XCTAssertNotEqual(light, dark)
+        XCTAssertTrue(workspace.runtime.ready)
+    }
 }

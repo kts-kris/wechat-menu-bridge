@@ -40,6 +40,8 @@ private enum Golden {
 
     static let hotBundles = #"{"items":[{"name":"policy.json","sha256":"\#(String(repeating: "a", count: 64))","verified":true}],"lastReloadAt":90,"loadedCount":1,"version":"2026.11.24"}"#
 
+    static let policyEvaluate = #"{"finalAction":"draft_only","matchedRule":"schedule","steps":[{"detail":"未命中退订锁或人身安全铁律","outcome":"pass","stage":"iron_rule","title":"① 安全铁律"},{"detail":"当前不在勿扰时段","outcome":"pass","stage":"quiet_hours","title":"② 勿扰时段"},{"detail":"通过关键词门禁","outcome":"pass","stage":"keywords","title":"③ 触发与忽略词"},{"detail":"入站规则：时间或见面约定 → 仅生成草稿（不自动发送）","outcome":"hit","stage":"risk_rules","title":"④ 内置与自定义风控"},{"detail":"仅生成草稿（不自动发送）","outcome":"hit","stage":"verdict","title":"⑤ 最终判定"}]}"#
+
     static let results: [RPCMethod: String] = [
         .systemStatus: status, .systemPauseAll: "true", .systemHealthCheck: healthCheck, .systemBundles: hotBundles,
         .xiaoheAccounts: #"[{"canRead":true,"canSend":true,"id":"acct","label":"账号","sendConversations":["wxid_a"]}]"#,
@@ -47,6 +49,7 @@ private enum Golden {
         .xiaoheGroupMembers: #"[{"displayName":"甲","userId":"u1"}]"#,
         .xiaoheCapabilities: capabilities, .settingsApply: "true",
         .modelPreview: #"{"action":"reply","text":"好的"}"#,
+        .policyEvaluate: policyEvaluate,
         .sessionArm: "true", .sessionPause: "true", .sessionSendOneShot: "true",
         .sessionRefreshReceipt: #"{"delivery":"delivered","operationId":"op-2","status":"submitted"}"#,
         .sessionRecover: "true", .sessionBackfill: #"{"jobId":"job-1"}"#,
@@ -205,7 +208,7 @@ final class V2ClientTests: XCTestCase {
     }
 
     func testAllRPCResultsRoundTripGoldenReplies() throws {
-        XCTAssertEqual(RPCMethod.allCases.count, 36)
+        XCTAssertEqual(RPCMethod.allCases.count, 37)
         XCTAssertEqual(Set(Golden.results.keys), Set(RPCMethod.allCases))
         func check<T: Codable>(_ method: RPCMethod, _ type: T.Type) throws {
             let json = Data(try XCTUnwrap(Golden.results[method]).utf8)
@@ -217,6 +220,7 @@ final class V2ClientTests: XCTestCase {
         try check(.xiaoheConversations, XiaoheConversationPage.self)
         try check(.xiaoheGroupMembers, [GroupMember].self)
         try check(.modelPreview, ModelPreviewResult.self)
+        try check(.policyEvaluate, PolicyEvaluateResult.self)
         try check(.sessionRefreshReceipt, SessionReceipt.self)
         try check(.sessionTraces, SessionTraceList.self)
         try check(.sessionResumeCooldown, Bool.self)
@@ -277,6 +281,34 @@ final class V2ClientTests: XCTestCase {
         }
         for invalid in [#"{"level":null}"#, #"{"level":"off"}"#] {
             XCTAssertThrowsError(try IPCv3.decodeStrict(RiskProfile.self, from: Data(invalid.utf8)))
+        }
+    }
+
+    func testRiskRuleOverridesAndCustomBlockContractIsStrict() throws {
+        XCTAssertEqual(CustomizableRuleId.allCases.count, 12)
+        // 默认配置往返：ruleOverrides 必须编码为 JSON 对象而非数组。
+        var profile = RiskProfile(level: .recommended)
+        profile.ruleOverrides = [.schedule: .draftOnly, .finance: .pauseSession]
+        profile.customBlockKeywords = ["报价", "生产事故"]
+        profile.customBlockAction = .draftOnly
+        let encoded = try IPCv3.encoder().encode(profile)
+        let text = String(decoding: encoded, as: UTF8.self)
+        XCTAssertTrue(text.contains(#""ruleOverrides":{"finance":"pause_session","schedule":"draft_only"}"#), text)
+        XCTAssertEqual(try IPCv3.decodeStrict(RiskProfile.self, from: encoded), profile)
+        XCTAssertEqual(profile.effectiveAction(for: .schedule), .draftOnly)
+        XCTAssertEqual(profile.effectiveAction(for: .credentials), .skipTurn)
+        XCTAssertEqual(profile.effectiveAction(for: .link), .allow)
+
+        // 安全铁律 crisis / peer-stopped / identity 不可出现在 ruleOverrides 中。
+        for bad in [
+            #"{"ruleOverrides":{"crisis":"allow"}}"#,
+            #"{"ruleOverrides":{"peer-stopped":"allow"}}"#,
+            #"{"ruleOverrides":{"identity":"allow"}}"#,
+            #"{"ruleOverrides":{"schedule":"invalid"}}"#,
+            #"{"customBlockAction":"allow"}"#,
+            #"{"customBlockKeywords":null}"#,
+        ] {
+            XCTAssertThrowsError(try IPCv3.decodeStrict(RiskProfile.self, from: Data(bad.utf8)), bad)
         }
     }
 
@@ -515,8 +547,12 @@ final class V2ClientTests: XCTestCase {
         var risk = RiskProfile()
         risk.takeoverAction = .ignore
         risk.selectedLevel = .minimal
-        settings.conversations["g@chatroom"] = ConversationPolicy(conversationId: "g@chatroom", label: "群", type: .group, riskProfile: risk,
-                                                                  useNativeReply: true, mentionReplySender: true)
+        risk.ruleOverrides = [.schedule: .draftOnly, .finance: .pauseSession]
+        risk.customBlockKeywords = ["报价", "生产事故"]
+        risk.customBlockAction = .draftOnly
+        let groupPolicy = ConversationPolicy(conversationId: "g@chatroom", label: "群", type: .group, riskProfile: risk,
+                                             useNativeReply: true, mentionReplySender: true)
+        settings.conversations["g@chatroom"] = groupPolicy
 
         _ = try await c.systemStatus()
         _ = try await c.systemHealthCheck(presetId: "m2", conversationId: "wxid_a")
@@ -533,6 +569,8 @@ final class V2ClientTests: XCTestCase {
         _ = try await c.xiaoheCapabilities()
         try await c.settingsApply(settings)
         _ = try await c.modelPreview(model: previewModel, text: "你好")
+        _ = try await c.policyEvaluate(.init(text: "周末一起吃饭吗", policy: groupPolicy,
+                                             quietHours: settings.runtime.quietHours, mentionsSelf: true, inQuietHours: false))
         try await c.sessionArm(.init(conversationId: "g@chatroom", replyMode: .auto, cloudApproved: true, groupConfirmed: true, apiKey: "fixture-key"))
         try await c.sessionPause(conversationId: "wxid_a", reason: .userPaused)
         try await c.sessionSendOneShot(.init(conversationId: "wxid_a", text: "你好", request: UUID().uuidString, at: 1000, groupConfirmed: false))
