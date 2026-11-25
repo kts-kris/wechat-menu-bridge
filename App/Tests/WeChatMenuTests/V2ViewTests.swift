@@ -170,8 +170,7 @@ final class V2ViewTests: XCTestCase {
     // 在 async @MainActor 测试中需让出并发执行器，SwiftUI .task 才能在 Swift 6.0 / macOS 15 上得到调度。
     private func settleAsync(until condition: () -> Bool) async {
         for _ in 0..<100 where !condition() {
-            try? await Task.sleep(nanoseconds: 25_000_000)
-            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            try? await Task.sleep(nanoseconds: 30_000_000)
         }
     }
 
@@ -1290,7 +1289,7 @@ final class V2ViewTests: XCTestCase {
         }
     }
 
-    func testDetailPagesRenderAtContentWidth() throws {
+    func testDetailPagesRenderAtContentWidth() async throws {
         let (workspace, _) = try makeWorkspace(connected: true)
         seededSettings(workspace)
         try workspace.settings.disk.save(workspace.settings.draft)
@@ -1304,7 +1303,11 @@ final class V2ViewTests: XCTestCase {
         _ = render(V2SettingsView(workspace: workspace), size: size)
         for section in MemorySection.allCases {
             workspace.memorySection = section
-            _ = render(MemoryView(workspace: workspace), size: size)
+            let memoryWindow = hosted(MemoryView(workspace: workspace), size: size)
+            if section == .persona {
+                await settleAsync { workspace.memory.documents[.persona]?.text != nil }
+            }
+            memoryWindow.close()
         }
         XCTAssertTrue(workspace.runtime.ready, "渲染期间后台不能因协议错误断开")
         XCTAssertNotNil(workspace.memory.documents[.persona]?.text)
