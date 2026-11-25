@@ -1713,4 +1713,10 @@ final class V2ViewTests: XCTestCase {
         XCTAssertEqual(transport.params["system.bundles"]?["action"] as? String, "reset")
         XCTAssertNil(transport.params["system.bundles"]?["manifestUrl"])
     }
+
+    func testModelPreviewDefaultSampleIsSafeCasualChat() {
+        XCTAssertEqual(ModelPreviewCard.defaultSample, "下楼刚好碰上有太阳")
+        XCTAssertFalse(ModelPreviewCard.defaultSample.contains("周末"))
+        XCTAssertFalse(ModelPreviewCard.defaultSample.contains("吃饭"))
+    }
 }

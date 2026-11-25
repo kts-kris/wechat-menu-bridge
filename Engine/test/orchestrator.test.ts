@@ -1022,3 +1022,16 @@ test('v2.2 #7 图片/语音富化写入耗时与失败原因轨迹，不记录�
     expect(serialized).not.toContain('ZmFrZQ==');
   } finally { await t.close(); }
 });
+
+test('设置页默认模型试拟例句不被风控拦截，真实调用试拟模型', async () => {
+  const t = await setup();
+  try {
+    const res = await t.bridge.preview({
+      model: { mode: 'local', url: t.model, name: 'fixture', stylePath: '', memoryPath: '', cloudApproved: false },
+      text: '下楼刚好碰上有太阳',
+    });
+    expect(res).toEqual({ action: 'reply', text: '哈哈，那挺好' });
+    expect(t.models.length).toBe(1);
+    expect(t.sends(peer).length).toBe(0);
+  } finally { await t.close(); }
+});

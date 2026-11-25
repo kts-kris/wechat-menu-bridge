@@ -291,6 +291,7 @@ private struct XiaoheConnectionCard: View {
                         Text("\(account.label)\(account.canSend ? "" : "（只读）")").tag(account.id)
                     }
                 }
+                .accessibilityIdentifier("mcp-account")
             }
             if let message { InlineNotice(text: message, tone: .active) }
             if let fault { InlineNotice(text: v2Explanation(fault), tone: .critical) }
@@ -780,13 +781,16 @@ private struct DefaultModelsCard: View {
 
 // MARK: - 模型试拟
 
-private struct ModelPreviewCard: View {
+struct ModelPreviewCard: View {
     @ObservedObject var workspace: V2Workspace
     @ObservedObject private var runtime: BridgeRuntime
     @ObservedObject private var settings: SettingsStore
 
+    // 默认试拟例句保持普通闲聊，不能命中风控「时间或见面约定」等拦截规则，否则不会真正调用模型。
+    static let defaultSample = "下楼刚好碰上有太阳"
+
     @State private var presetId: String?
-    @State private var sample = "周末要不要一起吃个饭？"
+    @State private var sample = ModelPreviewCard.defaultSample
     @State private var busy = false
     @State private var result: ModelPreviewResult?
     @State private var fault: String?
