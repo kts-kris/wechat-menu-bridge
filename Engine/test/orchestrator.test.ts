@@ -701,7 +701,8 @@ test('P0-1: 查回执从 submitted 变为 unknown 立即持久化锁定当前会
     await bridge.arm({ conversationId: secondPeer, replyMode: 'auto', consent: true });
     await until(() => bridge.status().sessions[peer]?.phase === 'listening' && bridge.status().sessions[secondPeer]?.phase === 'listening');
     net.push(incoming('ok1', peer));
-    await until(() => net.calls.filter(c => c.name === 'messages.send_text' && c.args.conversation_id === peer).length === 1);
+    await until(() => net.calls.filter(c => c.name === 'messages.send_text' && c.args.conversation_id === peer).length === 1 &&
+      !!bridge.status().sessions[peer]?.receipt?.operationId);
     forceUnknownOp = true;
     const receipt = await bridge.refreshReceipt(peer);
     expect(receipt.status).toBe('unknown');
@@ -1297,4 +1298,95 @@ test('v2.4 #28 全链路 6 段耗时埋点、SQLite 跨重启持久化、P50/P95
       expect(agg.recent.some(r => r.id === 'synthetic-old')).toBe(false);
     } finally { unsub(); }
   } finally { await t.close(); }
+});
+
+// ---- v2.4.0 #29：发信与 MCP 热路径加速 ----
+
+test('v2.4 #29 持久写连接复用、identify 与 fence 并行校验且异常后自动重建不削弱未知锁', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wmb-tx-pool-'));
+  const journal = new JournalV2(dir);
+  try {
+    let created = 0;
+    let closed = 0;
+    let maxConcurrentChecks = 0;
+    let activeChecks = 0;
+    let failNextSend = false;
+    const binding = { account_id: 'acct', instance_id: 'inst', login_generation: 'gen' };
+    const remote = { server: 'srv-1', binding };
+    const expectedIdentity = identityKey(remote);
+    const route = routeKey('http://127.0.0.1:21454/mcp', 'acct', peer);
+    journal.advance(route, expectedIdentity, 'c-1', [], Date.now());
+
+    const makeFakeWriter = () => {
+      created++;
+      const enter = async <T>(work: () => T): Promise<T> => {
+        activeChecks++;
+        maxConcurrentChecks = Math.max(maxConcurrentChecks, activeChecks);
+        await new Promise(r => setTimeout(r, 15));
+        activeChecks--;
+        return work();
+      };
+      return {
+        identify: () => enter(() => remote),
+        events: () => enter(() => ({ cursor: 'c-1', more: false, events: [] })),
+        sendText: async (_s: unknown, _t: string, _id: string, gate: () => void) => {
+          gate();
+          if (failNextSend) {
+            failNextSend = false;
+            throw new BridgeError('mcp-offline');
+          }
+          return { status: 'submitted', delivery: 'delivered', operation: 'op-1' };
+        },
+        reply: async () => ({ status: 'submitted', delivery: 'delivered' }),
+        close: async () => { closed++; },
+      } as unknown as XiaoheClient;
+    };
+
+    const tx = new TransmitService({
+      accountId: 'acct',
+      mcpUrl: 'http://127.0.0.1:21454/mcp',
+      journal,
+      createWriter: makeFakeWriter,
+    });
+
+    const fence = { route, cursor: 'c-1', scope: { ...binding, conversation_id: peer } };
+    let timingA: { fenceMs: number; wireMs: number } | undefined;
+    await tx.send({
+      sourceKind: 'auto', conversationId: peer, text: '你好一', attemptId: 'att-1',
+      expectedIdentity, fenceCursor: fence, checkStillValid: () => {}, originGuard: 'live_or_human', origin: 'live',
+      onTiming: value => { timingA = value; },
+    });
+    await tx.send({
+      sourceKind: 'auto', conversationId: peer, text: '你好二', attemptId: 'att-2',
+      expectedIdentity, fenceCursor: fence, checkStillValid: () => {}, originGuard: 'live_or_human', origin: 'live',
+    });
+
+    // 连续两次发信复用同一个 writer（createWriter 只调用 1 次），且 identify 与 events 并行执行
+    expect(created).toBe(1);
+    expect(closed).toBe(0);
+    expect(maxConcurrentChecks).toBe(2);
+    expect(timingA?.fenceMs).toBeGreaterThanOrEqual(0);
+
+    // 发信在途遇断连 → 触发 send-unknown 锁定且自动销毁损坏的 writer
+    failNextSend = true;
+    await expect(tx.send({
+      sourceKind: 'auto', conversationId: peer, text: '你好三', attemptId: 'att-3',
+      expectedIdentity, fenceCursor: fence, checkStillValid: () => {}, originGuard: 'live_or_human', origin: 'live',
+    })).rejects.toThrow('send-unknown');
+    expect(closed).toBe(1);
+    expect(journal.uncertain(peerKey('acct', peer))).toBeTruthy();
+
+    // 解除锁后再次发信自动重建新 writer，且 drain() 清理连接
+    journal.acknowledge('att-3');
+    await tx.send({
+      sourceKind: 'auto', conversationId: peer, text: '你好四', attemptId: 'att-4',
+      expectedIdentity, fenceCursor: fence, checkStillValid: () => {}, originGuard: 'live_or_human', origin: 'live',
+    });
+    expect(created).toBe(2);
+    await tx.drain();
+    expect(closed).toBe(2);
+  } finally {
+    journal.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -32,10 +32,14 @@ type Options = {
 const unknown = { status: 'unknown', delivery: 'unknown' } as const;
 const rejected = { status: 'rejected', delivery: 'failed' } as const;
 const definite = new Set(['wechat-permission', 'wechat-changed', 'send-rejected']);
+const dropWriterOn = new Set(['mcp-offline', 'wechat-changed', 'mcp-contract', 'send-unknown', 'stopped']);
 
 export class TransmitService {
   private readonly peers = new Map<string, Promise<unknown>>();
   private readonly writing = new Map<string, Promise<void>>();
+  private pooledWriter?: XiaoheClient;
+  private acquiringWriter?: Promise<XiaoheClient>;
+  private drained = false;
   constructor(private readonly options: Options) {}
   get inFlight() { return this.writing.size; }
 
@@ -43,7 +47,38 @@ export class TransmitService {
     return this.writing.get(peerKey(this.options.accountId, conversationId));
   }
 
-  async drain() { await Promise.allSettled(this.peers.values()); }
+  private async acquireWriter(): Promise<XiaoheClient> {
+    if (this.pooledWriter) return this.pooledWriter;
+    if (this.acquiringWriter) return this.acquiringWriter;
+    const task = Promise.resolve(this.options.createWriter()).then(client => {
+      if (this.drained) {
+        void client.close().catch(() => {});
+        throw new BridgeError('stopped');
+      }
+      this.pooledWriter = client;
+      return client;
+    }).finally(() => {
+      if (this.acquiringWriter === task) this.acquiringWriter = undefined;
+    });
+    this.acquiringWriter = task;
+    return task;
+  }
+
+  private dropWriter(target: XiaoheClient) {
+    if (this.pooledWriter !== target) return;
+    this.pooledWriter = undefined;
+    void target.close().catch(() => {});
+  }
+
+  async drain() {
+    this.drained = true;
+    await Promise.allSettled(this.peers.values());
+    const pending = this.acquiringWriter;
+    this.acquiringWriter = undefined;
+    const client = this.pooledWriter ?? (pending ? await pending.catch(() => undefined) : undefined);
+    this.pooledWriter = undefined;
+    if (client) await client.close().catch(() => {});
+  }
 
   async send(req: TransmitRequest): Promise<Receipt> {
     const { conversationId, text, attemptId } = req;
@@ -87,18 +122,27 @@ export class TransmitService {
         fenceCursor.route !== routeKey(mcpUrl, accountId, fenceCursor.scope.conversation_id))) throw new BridgeError('send-fence');
     const fenceStarted = performance.now();
     let wireStarted: number | undefined;
-    const writer = await createWriter();
+    const writer = await this.acquireWriter();
     let reserved = false, onWire = false;
     let release!: () => void;
     try {
       check();
-      const remote = await writer.identify(accountId, undefined, true, conversationId);
+      const shouldCheckFence = sourceKind !== 'plugin' && !!fenceCursor;
+      const [remoteResult, pageResult] = shouldCheckFence
+        ? await Promise.allSettled([
+            writer.identify(accountId, undefined, true, conversationId),
+            writer.events(fenceCursor!.scope, fenceCursor!.cursor),
+          ])
+        : [await Promise.allSettled([writer.identify(accountId, undefined, true, conversationId)]).then(r => r[0]!), undefined];
+      if (remoteResult.status === 'rejected') throw remoteResult.reason;
+      const remote = remoteResult.value;
       if (identityKey(remote) !== expectedIdentity) throw new BridgeError('wechat-changed');
       const scope = { ...remote.binding, conversation_id: conversationId };
-      if (sourceKind !== 'plugin' && fenceCursor) {
+      if (shouldCheckFence && fenceCursor) {
         if (fenceCursor.scope.instance_id !== remote.binding.instance_id ||
             fenceCursor.scope.login_generation !== remote.binding.login_generation) throw new BridgeError('send-fence');
-        const page = await writer.events(fenceCursor.scope, fenceCursor.cursor);
+        if (!pageResult || pageResult.status === 'rejected') throw pageResult?.reason ?? new BridgeError('send-fence');
+        const page = pageResult.value;
         const targetTouched = fenceCursor.scope.conversation_id !== undefined
           ? page.events.length > 0
           : page.events.some(raw => {
@@ -136,9 +180,11 @@ export class TransmitService {
       if (receipt.status === 'rejected' || receipt.delivery === 'failed') throw new BridgeError('send-rejected');
       return receipt;
     } catch (error) {
-      if (errorCode(error) === 'wechat-changed') this.options.onIdentityChanged?.();
+      const code = errorCode(error);
+      if (dropWriterOn.has(code)) this.dropWriter(writer);
+      if (code === 'wechat-changed') this.options.onIdentityChanged?.();
       if (!reserved) throw error;
-      if (!onWire || definite.has(errorCode(error))) {
+      if (!onWire || definite.has(code)) {
         if (journal.get(attemptId)?.status === 'trying') journal.complete(attemptId, rejected);
         throw error;
       }
@@ -149,6 +195,7 @@ export class TransmitService {
       } finally {
         try { this.options.onUnknown?.(conversationId, attemptId); } catch { /* 发信结果已独立归档 */ }
       }
+      this.dropWriter(writer);
       throw new BridgeError('send-unknown');
     } finally {
       if (release) {
@@ -156,7 +203,6 @@ export class TransmitService {
         release();
         this.options.onInFlight?.();
       }
-      await writer.close();
     }
   }
 

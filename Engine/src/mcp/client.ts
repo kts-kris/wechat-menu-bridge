@@ -183,8 +183,8 @@ export class XiaoheClient {
   }
 
   async identify(accountId: string, signal?: AbortSignal, requireWrite = false, conversationId?: string): Promise<RemoteIdentity> {
-    const { server } = await this.systemStatus(signal);
-    const rows = (await this.accounts(signal)).filter(row => row.id === accountId);
+    const [{ server }, allRows] = await Promise.all([this.systemStatus(signal), this.accounts(signal)]);
+    const rows = allRows.filter(row => row.id === accountId);
     const row = rows.length === 1 ? rows[0] : undefined;
     if (!row?.binding || !row.canRead || (requireWrite && (!row.canSend ||
       (conversationId && row.sendConversations && !row.sendConversations.includes('*') && !row.sendConversations.includes(conversationId))))) throw new BridgeError('wechat-permission');
