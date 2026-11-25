@@ -25,6 +25,7 @@ type Options = {
   ) => Promise<Decision>;
   prewarm?: (grant: Grant) => void;
   capabilities?: () => { nativeReply: boolean; mentionSend: boolean };
+  fastReplyMode?: () => boolean;
   quietHours?: () => QuietHoursConfig | undefined;
   quietHoursNow?: () => number;
   onStatus?: (status: SessionRuntimeState) => void; onScheduleCancelled?: (reason: ErrorCode) => void;
@@ -422,8 +423,11 @@ export class ConversationActor {
     clearTimeout(this.timer);
     const text = this.queue[0]!.text.trim();
     const fast = this.queue.length === 1 && (/[?？!！。~～]$/.test(text) || (text.length >= 4 && this.firstEnqueuedAfterGap));
-    const wait = Math.max(0, Math.min(this.options.debounceMs ?? (fast ? 260 : 620),
-      this.queue[0]!.seenAt + (this.options.batchMaxMs ?? 1350) - this.now()));
+    const fastMode = this.options.fastReplyMode?.() === true;
+    const defaultDebounceMs = fastMode ? (fast ? 120 : 340) : (fast ? 260 : 620);
+    const defaultBatchMaxMs = fastMode ? 800 : 1350;
+    const wait = Math.max(0, Math.min(this.options.debounceMs ?? defaultDebounceMs,
+      this.queue[0]!.seenAt + (this.options.batchMaxMs ?? defaultBatchMaxMs) - this.now()));
     this.timer = setTimeout(() => { void this.respond().catch(error => this.pause(errorCode(error))); }, wait);
     if (this.prewarmedRevision !== this.revision) {
       this.prewarmedRevision = this.revision;

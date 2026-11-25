@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { BridgeError } from '../contracts/errors.ts';
 import type { BackfillRequest, NormalizedEvent } from '../contracts/events.ts';
@@ -9,7 +9,7 @@ import { MemoryConsolidator } from '../memory/consolidator.ts';
 import { PromptContextAssembler } from '../memory/context-assembler.ts';
 import { PersonaEvolver } from '../memory/persona.ts';
 import { MemoryStore } from '../memory/store.ts';
-import { memoryScopeKey, type MemoryTarget, type ScopeTarget } from '../memory/types.ts';
+import { localDate, memoryScopeKey, type MemoryTarget, type ScopeTarget } from '../memory/types.ts';
 import { PluginManager } from '../plugins/manager.ts';
 import { ensurePrivateDir, readPrivateFile, resolveContainedPath } from '../storage/fs-safe.ts';
 import { HotBundleManager, type HotBundleOptions } from '../storage/hot-bundles.ts';
@@ -63,6 +63,7 @@ export class V3EngineApp {
       settings,
       getModelKey: preset => this.approvedCloudKey(preset),
       assemblePrompt: (policy, mode) => this.assemblePrompt(policy, mode),
+      promptCacheFingerprint: (policy, mode) => this.promptCacheFingerprint(policy, mode),
       onSettingsApplied: (next, cloudApiKeys) => this.handleSettingsApplied(next, cloudApiKeys),
     });
 
@@ -156,8 +157,11 @@ export class V3EngineApp {
           nextCursor: rows.length > limit ? String(offset + limit) : null,
         };
       },
-      'memory.rollback': ({ target, revId }) =>
-        toRpcRevision(this.memoryStore.rollback(this.resolveMemoryTarget(target), revId)),
+      'memory.rollback': ({ target, revId }) => {
+        const rev = this.memoryStore.rollback(this.resolveMemoryTarget(target), revId);
+        this.orchestrator.invalidatePromptCache();
+        return toRpcRevision(rev);
+      },
       'persona.proposals': ({ cursor, limit = 50 }) => {
         const offset = parseCursor(cursor);
         const rows = this.orchestrator.journal.listPersonaProposals(undefined, limit + 1, offset);
@@ -170,6 +174,7 @@ export class V3EngineApp {
         const updated = params.decision === 'accept_edited'
           ? this.persona.decide(params.proposalId, 'accept_edited', this.extractMemoryContent(params.content))
           : this.persona.decide(params.proposalId, params.decision);
+        if (params.decision !== 'reject') this.orchestrator.invalidatePromptCache();
         const result = toRpcProposal(updated);
         this.publishProposals(result);
         return result;
@@ -346,6 +351,36 @@ export class V3EngineApp {
       return readPrivateFile(safe, 48 * 1024).toString('utf8');
     }
     throw new BridgeError('invalid-configuration');
+  }
+
+  private fileStamp(path?: string): string {
+    if (!path) return '';
+    try {
+      const st = lstatSync(path);
+      return `${st.ino}:${st.mtimeMs}:${st.size}`;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'err';
+    }
+  }
+
+  private promptCacheFingerprint(policy: ConversationPolicy, mode: 'local' | 'cloud'): string {
+    const settings = this.orchestrator.currentSettings;
+    const accountId = settings.xiaohe.accountId;
+    const personaPath = this.memoryStore.pathFor({ kind: 'persona' });
+    const scopePath = accountId
+      ? this.memoryStore.pathFor({ kind: 'scope', accountId, conversationId: policy.conversationId, scopeType: policy.type, label: policy.label })
+      : undefined;
+    return [
+      mode,
+      localDate(Date.now()),
+      this.memoryDir,
+      accountId,
+      this.fileStamp(personaPath),
+      this.fileStamp(scopePath),
+      this.fileStamp(settings.memory.legacyStylePath || undefined),
+      this.fileStamp(settings.memory.legacyMemoryPath || undefined),
+      this.bundles.replyPromptAddon(),
+    ].join('\0');
   }
 
   private async assemblePrompt(policy: ConversationPolicy, mode: 'local' | 'cloud') {

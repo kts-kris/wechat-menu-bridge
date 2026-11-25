@@ -1390,3 +1390,154 @@ test('v2.4 #29 持久写连接复用、identify 与 fence 并行校验且异常�
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('v2.4 #31 长效 mtime/ino 提示词缓存跨轮命中，外部改盘与 memory.rollback 立即精确失效', async () => {
+  const net = await mockNetwork({ v2: true });
+  const dir = testDir();
+  const frames: unknown[] = [];
+  const app = new V3EngineApp(dir, line => frames.push(JSON.parse(line)));
+  const rpc = async (id: number, method: string, params: Record<string, unknown>) => {
+    await app.route(JSON.stringify({ v: 3, id, method, params }));
+    const reply = frames.at(-1) as { ok: boolean; result?: unknown; code?: string };
+    if (!reply?.ok) throw new Error(`${method} failed: ${reply?.code}`);
+    return reply.result as Record<string, unknown>;
+  };
+  try {
+    const settings = settingsV2Schema.parse({
+      schemaVersion: 2,
+      xiaohe: { mcpUrl: net.mcp, accountId: binding.account_id, accountLabel: '测试' },
+      models: [{ id: 'chat', name: 'Chat', kind: 'chat', mode: 'local', url: net.model, modelName: 'fixture' }],
+      defaultModels: { replyPresetId: 'chat' },
+      memory: {},
+      runtime: { fastReplyMode: true },
+      conversations: { [peer]: session(peer) },
+    });
+    await app.orchestrator.applySettings(settings);
+    const rev1 = await rpc(1, 'memory.save', {
+      target: { kind: 'persona' },
+      content: { text: '# 风格\n<!-- mem:id=mem_style_1 vis=local-only locked=false -->\n- 风格版本一\n' },
+    });
+    const rev2 = await rpc(2, 'memory.save', {
+      target: { kind: 'persona' },
+      content: { text: '# 风格\n<!-- mem:id=mem_style_1 vis=local-only locked=false -->\n- 风格版本二\n' },
+    });
+    expect(rev2.revId).not.toBe(rev1.revId);
+    const personaDoc = await rpc(3, 'memory.get', { target: { kind: 'persona' } });
+    const personaPath = String(personaDoc.path);
+
+    await app.orchestrator.arm({ conversationId: peer, replyMode: 'auto', consent: true });
+    await until(() => app.orchestrator.status().sessions[peer]?.phase === 'listening');
+
+    // 第 1 轮：加载版本二
+    net.push(incoming('cache-1', peer, { text: '今天吃什么？' }));
+    await until(() => net.calls.filter(c => c.name === 'messages.send_text').length === 1);
+    expect(net.models[0]?.messages[0].content).toContain('风格版本二');
+
+    // 第 2 轮：文件未变化，直接命中长效缓存（promptCacheHit=true, promptMs=0）
+    net.push(incoming('cache-2', peer, { text: '晚点去散步？' }));
+    await until(() => net.calls.filter(c => c.name === 'messages.send_text').length === 2);
+    const m2 = app.orchestrator.systemMetrics({ windowHours: 1, recentLimit: 10 });
+    expect(m2.recent[0]?.promptCacheHit).toBe(true);
+    expect(m2.recent[0]?.promptMs).toBe(0);
+
+    // 外部直接改盘（不经 RPC）：ino/mtime/size 变化应立即失效并读到最新内容
+    writeFileSync(personaPath, '# 风格\n<!-- mem:id=mem_style_1 vis=local-only locked=false -->\n- 外部直改风格\n', { mode: 0o600 });
+    net.push(incoming('cache-3', peer, { text: '明天有空吗？' }));
+    await until(() => net.calls.filter(c => c.name === 'messages.send_text').length === 3);
+    expect(net.models[2]?.messages[0].content).toContain('外部直改风格');
+
+    // memory.rollback 立即失效缓存并回到版本一（rev2 的快照保存了覆盖前的版本一）
+    await rpc(4, 'memory.rollback', { target: { kind: 'persona' }, revId: String(rev2.revId) });
+    net.push(incoming('cache-4', peer, { text: '周末怎么安排？' }));
+    await until(() => net.calls.filter(c => c.name === 'messages.send_text').length === 4);
+    expect(net.models[3]?.messages[0].content).toContain('风格版本一');
+  } finally {
+    await app.close();
+    await net.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v2.4 #31 群成员昵称补全与媒体富化复用已绑定身份，零额外 identify RTT', async () => {
+  const net = await mockNetwork({ v2: true });
+  const dir = testDir();
+  const settings = settingsV2Schema.parse({
+    schemaVersion: 2,
+    xiaohe: { mcpUrl: net.mcp, accountId: binding.account_id, accountLabel: '测试' },
+    models: [{ id: 'chat', name: 'Chat', kind: 'chat', mode: 'local', url: net.model, modelName: 'fixture' }],
+    defaultModels: { replyPresetId: 'chat' },
+    memory: {},
+    runtime: { fastReplyMode: true },
+    conversations: { [group]: session(group, { groupTrigger: 'all' }) },
+  });
+  const bridge = new BridgeOrchestrator(dir, { settings, actorTiming: { debounceMs: 20, batchMaxMs: 60 } });
+  const seenEvents: NormalizedEvent[] = [];
+  bridge.bus.subscribe('message', ev => { seenEvents.push(ev); });
+  try {
+    await bridge.setReadOnlySubscriptions([group]);
+    await until(() => bridge.currentIdentity !== undefined);
+    const statusBefore = net.calls.filter(c => c.name === 'system.status').length;
+    const accountsBefore = net.calls.filter(c => c.name === 'accounts.list').length;
+
+    // 推入缺少 sender_name 的群聊图片消息，同时触发媒体富化与群成员昵称补全
+    net.push(incoming('grp-media-1', group, {
+      type: 'image',
+      text: '',
+      sender_id: secondPeer,
+      sender_name: '',
+      attachments: [{ media_ref: 'media-1', mime_type: 'image/png' }],
+    }));
+    await until(() => seenEvents.some(ev => ev.messageRef === 'ref-grp-media-1'));
+
+    // 复用 ingest 已绑定 RemoteIdentity，不额外触发 system.status / accounts.list
+    expect(net.calls.filter(c => c.name === 'system.status').length).toBe(statusBefore);
+    expect(net.calls.filter(c => c.name === 'accounts.list').length).toBe(accountsBefore);
+    expect(seenEvents.find(ev => ev.messageRef === 'ref-grp-media-1')?.senderLabel).toBe('群成员');
+  } finally {
+    await bridge.close();
+    await net.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v2.4 #31 fastReplyMode 压缩自适应防抖窗口且保持连发合并与撤回剔除安全', async () => {
+  const net = await mockNetwork({ v2: true });
+  const dir = testDir();
+  const settings = settingsV2Schema.parse({
+    schemaVersion: 2,
+    xiaohe: { mcpUrl: net.mcp, accountId: binding.account_id, accountLabel: '测试' },
+    models: [{ id: 'chat', name: 'Chat', kind: 'chat', mode: 'local', url: net.model, modelName: 'fixture' }],
+    defaultModels: { replyPresetId: 'chat' },
+    memory: {},
+    runtime: { fastReplyMode: true },
+    conversations: { [peer]: session(peer) },
+  });
+  // 不传 debounceMs，使用 fastReplyMode 内置 120ms / 340ms 窗口
+  const bridge = new BridgeOrchestrator(dir, { settings });
+  try {
+    await bridge.arm({ conversationId: peer, replyMode: 'auto', consent: true });
+    await until(() => bridge.status().sessions[peer]?.phase === 'listening');
+
+    // 1. 完整单句在 fastReplyMode 下走 120ms 压缩窗口（明显快于常规 260ms）
+    net.push(incoming('fast-deb-1', peer, { text: '今天天气真不错！' }));
+    await until(() => net.calls.filter(c => c.name === 'messages.send_text').length === 1);
+    const firstMetric = bridge.systemMetrics({ windowHours: 1, recentLimit: 5 }).recent[0]!;
+    expect(firstMetric.debounceMs).toBeLessThan(240);
+
+    // 2. 连发短句 + 撤回仍精确剔除撤回句并仅回复保留句
+    net.push(
+      incoming('fast-deb-2a', peer, { text: '等下' }),
+      incoming('fast-deb-2b', peer, { text: '发错了' }),
+    );
+    await delay(40);
+    net.push(incoming('fast-deb-recall', peer, {
+      event_type: 'message.recalled', type: 'recall', text: '', recall_target_ref: 'ref-fast-deb-2b',
+    }));
+    await until(() => net.calls.filter(c => c.name === 'messages.send_text').length === 2);
+    expect(JSON.parse(net.models[1]?.messages[1].content).latest).toEqual(['等下']);
+  } finally {
+    await bridge.close();
+    await net.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
