@@ -6,8 +6,8 @@ import UniformTypeIdentifiers
 
 enum AppVersion {
     // swift test 的 Bundle.main 是测试运行器，不能把它的版本号当成 App 版本。
-    static let fallbackShort = "2.3.0"
-    static let fallbackBuild = "24"
+    static let fallbackShort = "2.4.0"
+    static let fallbackBuild = "25"
 
     private static var info: [String: Any]? {
         let value = Bundle.main.infoDictionary
