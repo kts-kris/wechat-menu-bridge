@@ -71,10 +71,19 @@ function extractStandardJSON(raw: string): string {
   return message.content;
 }
 
+type SseOptions = {
+  stopOnFinishReason?: boolean;
+  isComplete?: (text: string) => boolean;
+};
+
 class SseAccumulator {
   private readonly parts: string[] = [];
+  private hasContent = false;
   private finishReason?: string;
+  complete = false;
   done = false;
+
+  constructor(private readonly options: SseOptions = {}) {}
 
   feedLine(rawLine: string) {
     const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
@@ -93,14 +102,26 @@ class SseAccumulator {
     if (!choice) throw new BridgeError('model-format');
     const delta = object(choice.delta) ?? object(choice.message);
     if (delta?.tool_calls || delta?.function_call || delta?.refusal) throw new BridgeError('model-format');
-    if (typeof delta?.content === 'string') this.parts.push(delta.content);
     if (typeof choice.finish_reason === 'string' && choice.finish_reason) {
       this.finishReason = choice.finish_reason;
+    }
+    const content = typeof delta?.content === 'string' ? delta.content : undefined;
+    if (content !== undefined) {
+      this.parts.push(content);
+      if (content.length > 0) this.hasContent = true;
+    }
+    if (this.finishReason !== undefined && this.options.stopOnFinishReason && (this.finishReason !== 'stop' || this.hasContent)) {
+      this.done = true;
+      return;
+    }
+    if (!this.complete && this.finishReason === undefined && this.options.isComplete && content && content.includes('}') &&
+      this.options.isComplete(this.parts.join(''))) {
+      this.complete = true;
     }
   }
 
   finish(): string {
-    if (!this.done && this.finishReason === undefined) throw new BridgeError('model-unavailable');
+    if (!this.done && !this.complete && this.finishReason === undefined) throw new BridgeError('model-unavailable');
     if (this.finishReason !== undefined && this.finishReason !== 'stop') {
       throw new BridgeError('model-format');
     }
@@ -111,7 +132,7 @@ class SseAccumulator {
 }
 
 export async function readCompletionContent(response: Response, maxBytes: number,
-  options: { idleTimeoutMs?: number; signal?: AbortSignal; onFirstByte?: () => void } = {}): Promise<string> {
+  options: { idleTimeoutMs?: number; completeGraceMs?: number; signal?: AbortSignal; onFirstByte?: () => void; stopOnFinishReason?: boolean; isComplete?: (text: string) => boolean } = {}): Promise<string> {
   if (!response.body) throw new BridgeError('model-format');
   const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
   const reader = response.body.getReader();
@@ -121,18 +142,33 @@ export async function readCompletionContent(response: Response, maxBytes: number
     bytes += value.byteLength;
     if (bytes > maxBytes) throw new BridgeError('model-format');
   };
+  const sseOptions: SseOptions = { stopOnFinishReason: options.stopOnFinishReason, isComplete: options.isComplete };
 
   if (contentType.includes('text/event-stream')) {
     const decoder = new TextDecoder('utf-8', { fatal: true });
-    const acc = new SseAccumulator();
+    const acc = new SseAccumulator(sseOptions);
+    const baseIdleMs = options.idleTimeoutMs ?? 45_000;
+    const graceMs = Math.min(baseIdleMs, options.completeGraceMs ?? 120);
     let pending = '';
     try {
       for (;;) {
         options.signal?.throwIfAborted();
         const idle = new AbortController();
-        const timer = setTimeout(() => idle.abort(new BridgeError('model-timeout')), options.idleTimeoutMs ?? 45_000);
+        const waitMs = acc.complete ? graceMs : baseIdleMs;
+        const timer = setTimeout(() => idle.abort(new BridgeError('model-timeout')), waitMs);
         const signal = options.signal ? AbortSignal.any([options.signal, idle.signal]) : idle.signal;
-        const { value, done } = await untilAborted(reader.read(), signal).finally(() => clearTimeout(timer));
+        let read: Awaited<ReturnType<typeof reader.read>>;
+        try {
+          read = await untilAborted(reader.read(), signal).finally(() => clearTimeout(timer));
+        } catch (error) {
+          // 已收到完整合法的决策 JSON 后仅短暂等待 finish_reason；若对端挂起尾流则平滑提前收尾。
+          if (acc.complete && idle.signal.aborted && !options.signal?.aborted) {
+            acc.done = true;
+            break;
+          }
+          throw error;
+        }
+        const { value, done } = read;
         if (done) break;
         countBytes(value);
         try { pending += decoder.decode(value, { stream: true }); }
@@ -172,7 +208,7 @@ export async function readCompletionContent(response: Response, maxBytes: number
   const trimmed = raw.trimStart();
   // 部分中转网关返回 SSE 正文但未设 text/event-stream 头，按正文前缀自动兜底解析。
   if (trimmed.startsWith('data:') || trimmed.startsWith(':')) {
-    const acc = new SseAccumulator();
+    const acc = new SseAccumulator(sseOptions);
     for (const line of raw.split('\n')) {
       acc.feedLine(line);
       if (acc.done) break;
