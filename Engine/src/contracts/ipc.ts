@@ -127,6 +127,12 @@ export const turnPerfSampleSchema = z.strictObject({
   effort: z.enum(['default', 'low', 'medium', 'high', 'max']).optional(),
   fallbackUsed: z.boolean(),
   errorCode: errorCodeSchema.optional(),
+  presetId: identifierSchema.optional(),
+  modelName: z.string().max(160).optional(),
+  promptTokens: count.default(0),
+  cachedTokens: count.default(0),
+  completionTokens: count.default(0),
+  estimatedCostUsd: z.number().min(0).default(0),
 });
 export type TurnPerfSample = z.infer<typeof turnPerfSampleSchema>;
 
@@ -140,6 +146,31 @@ export const perfStageSummarySchema = z.strictObject({
 });
 export type PerfStageSummary = z.infer<typeof perfStageSummarySchema>;
 
+export const tokenMetricsSummarySchema = z.strictObject({
+  promptTokens: count,
+  cachedTokens: count,
+  completionTokens: count,
+  kvCacheHitRate: z.number().int().min(0).max(100),
+  estimatedCostUsd: z.number().min(0),
+});
+export type TokenMetricsSummary = z.infer<typeof tokenMetricsSummarySchema>;
+
+export const presetPerfSummarySchema = z.strictObject({
+  presetId: z.string().min(1),
+  modelName: z.string().max(160),
+  mode: z.enum(['local', 'cloud']).optional(),
+  turns: count,
+  p50TotalMs: count,
+  p95TotalMs: count,
+  p50TtftMs: count,
+  promptTokens: count,
+  cachedTokens: count,
+  completionTokens: count,
+  kvCacheHitRate: z.number().int().min(0).max(100),
+  estimatedCostUsd: z.number().min(0),
+});
+export type PresetPerfSummary = z.infer<typeof presetPerfSummarySchema>;
+
 export const systemMetricsResultSchema = z.strictObject({
   windowHours: z.number().int().min(1).max(336),
   sampleCount: count,
@@ -152,8 +183,10 @@ export const systemMetricsResultSchema = z.strictObject({
     maxMs: count,
     avgMs: count,
   }),
+  tokens: tokenMetricsSummarySchema,
   primaryBottleneck: perfStageSchema.optional(),
   stages: z.array(perfStageSummarySchema),
+  byPreset: z.array(presetPerfSummarySchema),
   recent: z.array(turnPerfSampleSchema),
 });
 export type SystemMetricsResult = z.infer<typeof systemMetricsResultSchema>;

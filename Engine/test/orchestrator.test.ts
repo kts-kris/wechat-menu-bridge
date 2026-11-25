@@ -1541,3 +1541,87 @@ test('v2.4 #31 fastReplyMode 压缩自适应防抖窗口且保持连发合并与
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('v2.5 #36 turn_metrics 幂等迁移、Token 与 KV 缓存汇总及多模型预设横向聚合', () => {
+  const dir = testDir();
+  try {
+    // 模拟 v2.4.0 旧版 turn_metrics 表（不含 preset_id/model_name/token 列），验证重启自动幂等 ALTER TABLE
+    const { Database } = require('bun:sqlite') as typeof import('bun:sqlite');
+    const dbPath = join(dir, 'bridge.sqlite');
+    const now = Date.now();
+    const legacyDb = new Database(dbPath, { create: true });
+    legacyDb.exec(`
+      CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO schema_meta(key, value) VALUES('version', '2');
+      CREATE TABLE turn_metrics (
+        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL,
+        ingest_ms INTEGER NOT NULL, debounce_ms INTEGER NOT NULL, prompt_ms INTEGER NOT NULL,
+        prompt_cache_hit INTEGER NOT NULL DEFAULT 0, model_ttft_ms INTEGER NOT NULL, model_total_ms INTEGER NOT NULL,
+        fence_ms INTEGER NOT NULL, send_wire_ms INTEGER NOT NULL, total_ms INTEGER NOT NULL,
+        bottleneck TEXT NOT NULL, model_mode TEXT, effort TEXT, fallback_used INTEGER NOT NULL DEFAULT 0, error_code TEXT
+      );
+      INSERT INTO turn_metrics VALUES('legacy-1','wxid_a',${now - 60_000},'sent',20,120,5,1,400,600,30,40,815,'model_ttft','local','low',0,NULL);
+    `);
+    legacyDb.close();
+    const { chmodSync } = require('node:fs') as typeof import('node:fs');
+    chmodSync(dbPath, 0o600);
+
+    const journal = new JournalV2(dir);
+    try {
+      journal.recordTurnMetric({
+        id: 't-cloud-1', conversationId: peer, at: now - 20_000, outcome: 'sent',
+        ingestMs: 25, debounceMs: 120, promptMs: 0, promptCacheHit: true,
+        modelTtftMs: 1200, modelTotalMs: 1800, fenceMs: 40, sendWireMs: 50, totalMs: 2035,
+        bottleneck: 'model_ttft', modelMode: 'cloud', effort: 'low', fallbackUsed: false,
+        presetId: 'p-cloud', modelName: 'gpt-5',
+        promptTokens: 1000, cachedTokens: 800, completionTokens: 60, estimatedCostUsd: 0.0012,
+      });
+      journal.recordTurnMetric({
+        id: 't-cloud-2', conversationId: peer, at: now - 10_000, outcome: 'sent',
+        ingestMs: 20, debounceMs: 120, promptMs: 0, promptCacheHit: true,
+        modelTtftMs: 800, modelTotalMs: 1200, fenceMs: 35, sendWireMs: 45, totalMs: 1420,
+        bottleneck: 'model_ttft', modelMode: 'cloud', effort: 'low', fallbackUsed: false,
+        presetId: 'p-cloud', modelName: 'gpt-5',
+        promptTokens: 1000, cachedTokens: 600, completionTokens: 40, estimatedCostUsd: 0.0014,
+      });
+      journal.recordTurnMetric({
+        id: 't-local-1', conversationId: peer, at: now - 5_000, outcome: 'sent',
+        ingestMs: 15, debounceMs: 120, promptMs: 0, promptCacheHit: true,
+        modelTtftMs: 220, modelTotalMs: 450, fenceMs: 30, sendWireMs: 40, totalMs: 655,
+        bottleneck: 'model_gen', modelMode: 'local', effort: 'low', fallbackUsed: false,
+        presetId: 'p-local', modelName: 'qwen-local',
+        promptTokens: 500, cachedTokens: 250, completionTokens: 30, estimatedCostUsd: 0,
+      });
+
+      const summary = journal.queryTurnMetrics({ windowHours: 24, nowMs: now });
+      expect(summary.sampleCount).toBe(4);
+      expect(summary.tokens).toEqual({
+        promptTokens: 2500,
+        cachedTokens: 1650,
+        completionTokens: 130,
+        kvCacheHitRate: 66,
+        estimatedCostUsd: 0.0026,
+      });
+      // 按 turns 降序排列：p-cloud (2 轮) -> p-local (1 轮) -> legacy (1 轮无 presetId 归入 unknown)
+      const cloudPreset = summary.byPreset.find(p => p.presetId === 'p-cloud');
+      const localPreset = summary.byPreset.find(p => p.presetId === 'p-local');
+      expect(cloudPreset).toEqual({
+        presetId: 'p-cloud', modelName: 'gpt-5', mode: 'cloud', turns: 2,
+        p50TotalMs: 1420, p95TotalMs: 2035, p50TtftMs: 800,
+        promptTokens: 2000, cachedTokens: 1400, completionTokens: 100,
+        kvCacheHitRate: 70, estimatedCostUsd: 0.0026,
+      });
+      expect(localPreset).toEqual({
+        presetId: 'p-local', modelName: 'qwen-local', mode: 'local', turns: 1,
+        p50TotalMs: 655, p95TotalMs: 655, p50TtftMs: 220,
+        promptTokens: 500, cachedTokens: 250, completionTokens: 30,
+        kvCacheHitRate: 50, estimatedCostUsd: 0,
+      });
+      expect(rpcSchemas['system.metrics'].result.safeParse(summary).success).toBe(true);
+    } finally {
+      journal.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

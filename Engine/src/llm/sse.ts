@@ -1,5 +1,34 @@
 import { BridgeError, object } from '../../contracts.ts';
 
+export type TokenUsage = {
+  promptTokens: number;
+  cachedTokens: number;
+  completionTokens: number;
+};
+
+function nonNegInt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
+}
+
+/** 兼容 OpenAI / DeepSeek / Anthropic 兼容网关的 usage 与 KV Cache 命中字段。 */
+export function extractTokenUsage(raw: unknown): TokenUsage | undefined {
+  const usage = object(raw);
+  if (!usage) return undefined;
+  const prompt = nonNegInt(usage.prompt_tokens) ?? nonNegInt(usage.input_tokens);
+  const completion = nonNegInt(usage.completion_tokens) ?? nonNegInt(usage.output_tokens);
+  if (prompt === undefined && completion === undefined) return undefined;
+  const promptTokens = prompt ?? 0;
+  const completionTokens = completion ?? 0;
+  const details = object(usage.prompt_tokens_details) ?? object(usage.input_tokens_details);
+  const rawCached = nonNegInt(details?.cached_tokens)
+    ?? nonNegInt(usage.prompt_cache_hit_tokens)
+    ?? nonNegInt(usage.cache_read_input_tokens)
+    ?? nonNegInt(usage.cached_tokens)
+    ?? 0;
+  const cachedTokens = Math.min(promptTokens, rawCached);
+  return { promptTokens, cachedTokens, completionTokens };
+}
+
 export function stripJsonFence(text: string) {
   const trimmed = text.trim();
   const match = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(trimmed);
@@ -59,7 +88,7 @@ export async function untilAborted<T>(task: Promise<T>, signal?: AbortSignal): P
   });
 }
 
-function extractStandardJSON(raw: string): string {
+function extractStandardJSON(raw: string): { content: string; usage?: TokenUsage } {
   let data: Record<string, unknown> | undefined;
   try { data = object(JSON.parse(raw)); } catch { throw new BridgeError('model-format'); }
   const choice = Array.isArray(data?.choices) && data.choices.length === 1 ? object(data.choices[0]) : undefined;
@@ -68,11 +97,12 @@ function extractStandardJSON(raw: string): string {
     message.tool_calls || message.function_call || message.refusal) {
     throw new BridgeError('model-format');
   }
-  return message.content;
+  return { content: message.content, usage: extractTokenUsage(data?.usage) };
 }
 
 type SseOptions = {
   stopOnFinishReason?: boolean;
+  waitForUsage?: boolean;
   isComplete?: (text: string) => boolean;
 };
 
@@ -80,6 +110,8 @@ class SseAccumulator {
   private readonly parts: string[] = [];
   private hasContent = false;
   private finishReason?: string;
+  usage?: TokenUsage;
+  awaitingUsage = false;
   complete = false;
   done = false;
 
@@ -96,7 +128,12 @@ class SseAccumulator {
     try { chunk = object(JSON.parse(payload)); } catch { throw new BridgeError('model-format'); }
     if (!chunk) throw new BridgeError('model-format');
     if (chunk.error) throw new BridgeError('model-unavailable');
-    if (!Array.isArray(chunk.choices) || chunk.choices.length === 0) return;
+    const parsedUsage = extractTokenUsage(chunk.usage);
+    if (parsedUsage) this.usage = parsedUsage;
+    if (!Array.isArray(chunk.choices) || chunk.choices.length === 0) {
+      if (this.awaitingUsage && this.usage) this.done = true;
+      return;
+    }
     if (chunk.choices.length !== 1) throw new BridgeError('model-format');
     const choice = object(chunk.choices[0]);
     if (!choice) throw new BridgeError('model-format');
@@ -111,7 +148,11 @@ class SseAccumulator {
       if (content.length > 0) this.hasContent = true;
     }
     if (this.finishReason !== undefined && this.options.stopOnFinishReason && (this.finishReason !== 'stop' || this.hasContent)) {
-      this.done = true;
+      if (this.finishReason === 'stop' && this.options.waitForUsage && !this.usage) {
+        this.awaitingUsage = true;
+      } else {
+        this.done = true;
+      }
       return;
     }
     if (!this.complete && this.finishReason === undefined && this.options.isComplete && content && content.includes('}') &&
@@ -121,7 +162,7 @@ class SseAccumulator {
   }
 
   finish(): string {
-    if (!this.done && !this.complete && this.finishReason === undefined) throw new BridgeError('model-unavailable');
+    if (!this.done && !this.complete && !this.awaitingUsage && this.finishReason === undefined) throw new BridgeError('model-unavailable');
     if (this.finishReason !== undefined && this.finishReason !== 'stop') {
       throw new BridgeError('model-format');
     }
@@ -132,7 +173,11 @@ class SseAccumulator {
 }
 
 export async function readCompletionContent(response: Response, maxBytes: number,
-  options: { idleTimeoutMs?: number; completeGraceMs?: number; signal?: AbortSignal; onFirstByte?: () => void; stopOnFinishReason?: boolean; isComplete?: (text: string) => boolean } = {}): Promise<string> {
+  options: {
+    idleTimeoutMs?: number; completeGraceMs?: number; usageGraceMs?: number;
+    signal?: AbortSignal; onFirstByte?: () => void; onUsage?: (usage: TokenUsage) => void;
+    stopOnFinishReason?: boolean; isComplete?: (text: string) => boolean;
+  } = {}): Promise<string> {
   if (!response.body) throw new BridgeError('model-format');
   const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
   const reader = response.body.getReader();
@@ -142,27 +187,33 @@ export async function readCompletionContent(response: Response, maxBytes: number
     bytes += value.byteLength;
     if (bytes > maxBytes) throw new BridgeError('model-format');
   };
-  const sseOptions: SseOptions = { stopOnFinishReason: options.stopOnFinishReason, isComplete: options.isComplete };
+  const usageGraceMs = options.usageGraceMs ?? 0;
+  const sseOptions: SseOptions = {
+    stopOnFinishReason: options.stopOnFinishReason,
+    waitForUsage: usageGraceMs > 0,
+    isComplete: options.isComplete,
+  };
 
   if (contentType.includes('text/event-stream')) {
     const decoder = new TextDecoder('utf-8', { fatal: true });
     const acc = new SseAccumulator(sseOptions);
     const baseIdleMs = options.idleTimeoutMs ?? 45_000;
     const graceMs = Math.min(baseIdleMs, options.completeGraceMs ?? 120);
+    const tailUsageMs = Math.min(baseIdleMs, usageGraceMs);
     let pending = '';
     try {
       for (;;) {
         options.signal?.throwIfAborted();
         const idle = new AbortController();
-        const waitMs = acc.complete ? graceMs : baseIdleMs;
+        const waitMs = acc.awaitingUsage ? tailUsageMs : acc.complete ? graceMs : baseIdleMs;
         const timer = setTimeout(() => idle.abort(new BridgeError('model-timeout')), waitMs);
         const signal = options.signal ? AbortSignal.any([options.signal, idle.signal]) : idle.signal;
         let read: Awaited<ReturnType<typeof reader.read>>;
         try {
           read = await untilAborted(reader.read(), signal).finally(() => clearTimeout(timer));
         } catch (error) {
-          // 已收到完整合法的决策 JSON 后仅短暂等待 finish_reason；若对端挂起尾流则平滑提前收尾。
-          if (acc.complete && idle.signal.aborted && !options.signal?.aborted) {
+          // 已收到 finish_reason=stop 或完整合法决策 JSON 后仅短暂等待尾包 usage，超时平滑提前收尾。
+          if ((acc.awaitingUsage || acc.complete) && idle.signal.aborted && !options.signal?.aborted) {
             acc.done = true;
             break;
           }
@@ -189,7 +240,9 @@ export async function readCompletionContent(response: Response, maxBytes: number
         } catch { throw new BridgeError('model-unavailable'); }
       }
     } finally { void reader.cancel().catch(() => {}); }
-    return acc.finish();
+    const text = acc.finish();
+    if (acc.usage) options.onUsage?.(acc.usage);
+    return text;
   }
 
   const chunks: Uint8Array[] = [];
@@ -213,7 +266,11 @@ export async function readCompletionContent(response: Response, maxBytes: number
       acc.feedLine(line);
       if (acc.done) break;
     }
-    return acc.finish();
+    const text = acc.finish();
+    if (acc.usage) options.onUsage?.(acc.usage);
+    return text;
   }
-  return extractStandardJSON(raw);
+  const standard = extractStandardJSON(raw);
+  if (standard.usage) options.onUsage?.(standard.usage);
+  return standard.content;
 }

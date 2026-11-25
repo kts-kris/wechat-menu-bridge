@@ -81,16 +81,17 @@ export class ModelClient {
     const { signal, timeoutMs, idleTimeoutMs, json, onTrace } = options;
     const effort = this.disableReasoningEffort || this.preset.reasoningEffort === 'default' ? undefined
       : options.fastReplyMode ? 'low' : this.preset.reasoningEffort ?? 'max';
-    return requestModel({ url: this.url, key: this.key, mode: this.preset.mode, effort, signal, timeoutMs, onTrace, onTiming: options.onTiming,
+    return requestModel({ url: this.url, key: this.key, mode: this.preset.mode, effort, includeStreamUsage: json, signal, timeoutMs, onTrace, onTiming: options.onTiming,
       retryFormat: json,
-      body: (value, correct) => JSON.stringify({
+      body: (value, correct, includeUsage) => JSON.stringify({
         model: this.preset.modelName, stream: true, max_tokens: Math.max(this.preset.maxTokens, options.minMaxTokens),
         temperature: this.preset.temperature, reasoning_effort: value,
+        ...(includeUsage && { stream_options: { include_usage: true } }),
         messages: correct ? [...messages, { role: 'user', content: '仅输出符合规则的决策 JSON 对象。' }] : messages,
         ...(json && { response_format: { type: 'json_object' } }),
       }),
-      parse: async (response, signal, onFirstByte) => parse(await readCompletionContent(response, MAX_MODEL_RESPONSE_BYTES,
-        { signal, idleTimeoutMs, onFirstByte, stopOnFinishReason: json, isComplete: options.isComplete })),
+      parse: async (response, signal, onFirstByte, onUsage) => parse(await readCompletionContent(response, MAX_MODEL_RESPONSE_BYTES,
+        { signal, idleTimeoutMs, onFirstByte, onUsage, stopOnFinishReason: json, usageGraceMs: json ? 50 : 0, isComplete: options.isComplete })),
     });
   }
 

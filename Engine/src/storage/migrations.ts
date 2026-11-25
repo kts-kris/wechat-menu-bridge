@@ -169,7 +169,13 @@ CREATE TABLE IF NOT EXISTS turn_metrics (
   model_mode TEXT,
   effort TEXT,
   fallback_used INTEGER NOT NULL DEFAULT 0,
-  error_code TEXT
+  error_code TEXT,
+  preset_id TEXT,
+  model_name TEXT,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  estimated_cost_usd REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS turn_metrics_time ON turn_metrics(at DESC);
 CREATE INDEX IF NOT EXISTS turn_metrics_conv ON turn_metrics(conversation_id, at DESC);
@@ -184,6 +190,14 @@ const addedColumns = {
   opted_out: [['at', 'INTEGER NOT NULL DEFAULT 0']],
   events: [['recalled', 'INTEGER NOT NULL DEFAULT 0']],
   attempts: [['plugin_id', 'TEXT']],
+  turn_metrics: [
+    ['preset_id', 'TEXT'],
+    ['model_name', 'TEXT'],
+    ['prompt_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+    ['cached_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+    ['completion_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+    ['estimated_cost_usd', 'REAL NOT NULL DEFAULT 0'],
+  ],
 } as const;
 
 export function migrateJournalToV2(db: Database): void {

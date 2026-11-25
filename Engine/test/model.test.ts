@@ -6,7 +6,7 @@ import { ReplyModel } from '../model.ts';
 import { ModelClient, resetEndpointCapabilities } from '../src/llm/client.ts';
 import { requestModel } from '../src/llm/request.ts';
 import { ModelRouter } from '../src/llm/router.ts';
-import { extractJsonObject, readCompletionContent } from '../src/llm/sse.ts';
+import { extractJsonObject, extractTokenUsage, readCompletionContent } from '../src/llm/sse.ts';
 import { mockNetwork, syntheticText } from './fixture.ts';
 
 function stubFetch(implementation: (...args: Parameters<typeof fetch>) => Promise<Response>) {
@@ -377,4 +377,62 @@ test('v2.4 #30 SSE 收到完整决策 JSON 或 finish_reason=stop 时提前完�
     expect(await client.chat(['试试截断恢复'], [])).toEqual({ action: 'skip' });
     expect(calls).toBe(4);
   } finally { fetchStub.mockRestore(); }
+});
+
+test('v2.5 #36 usage 解析兼容 OpenAI/DeepSeek/Anthropic 缓存字段，SSE 尾包采集与 stream_options 400 自动降级', async () => {
+  expect(extractTokenUsage({
+    prompt_tokens: 1200, completion_tokens: 45, prompt_tokens_details: { cached_tokens: 960 },
+  })).toEqual({ promptTokens: 1200, cachedTokens: 960, completionTokens: 45 });
+  expect(extractTokenUsage({
+    prompt_tokens: 500, completion_tokens: 30, prompt_cache_hit_tokens: 400,
+  })).toEqual({ promptTokens: 500, cachedTokens: 400, completionTokens: 30 });
+  expect(extractTokenUsage({
+    input_tokens: 300, output_tokens: 20, cache_read_input_tokens: 999,
+  })).toEqual({ promptTokens: 300, cachedTokens: 300, completionTokens: 20 });
+
+  resetEndpointCapabilities();
+  const seen: Record<string, unknown>[] = [];
+  let calls = 0;
+  const fetchStub = stubFetch(async (_url, init) => {
+    calls++;
+    seen.push(JSON.parse(String(init?.body)));
+    if (calls === 1) {
+      // 模拟 OpenAI 兼容流：先 content -> finish_reason=stop -> 尾包 usage（不含 [DONE] 且挂起）
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(sseChunk('{"action":"reply","text":"收到啦"}'));
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'));
+          controller.enqueue(encoder.encode('data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":28,"prompt_tokens_details":{"cached_tokens":750}}}\n\n'));
+        },
+      }), { headers: sseHeaders });
+    }
+    if (calls === 2) {
+      return Response.json({ error: { message: 'unknown parameter: stream_options' } }, { status: 400 });
+    }
+    return Response.json({
+      choices: [{ finish_reason: 'stop', message: { content: '{"action":"skip"}' } }],
+      usage: { prompt_tokens: 400, completion_tokens: 12, prompt_cache_hit_tokens: 200 },
+    });
+  });
+  try {
+    const clientA = new ModelClient({ ...testPreset, url: 'https://usage-a.example.invalid/v1/chat/completions', reasoningEffort: 'low' }, 'synthetic-key');
+    let timingA: { usage?: { promptTokens: number; cachedTokens: number; completionTokens: number } } | undefined;
+    expect(await clientA.chat(['你好'], [], undefined, undefined, undefined, undefined, { onTiming: v => { timingA = v; } }))
+      .toEqual({ action: 'reply', text: '收到啦' });
+    expect(seen[0]?.stream_options).toEqual({ include_usage: true });
+    expect(timingA?.usage).toEqual({ promptTokens: 1000, cachedTokens: 750, completionTokens: 28 });
+
+    // 另一端点返回 400 不支持 stream_options → 自动移除并缓存端点能力
+    const clientB = new ModelClient({ ...testPreset, url: 'https://usage-b.example.invalid/v1/chat/completions', reasoningEffort: 'low' }, 'synthetic-key');
+    let timingB: { usage?: { promptTokens: number; cachedTokens: number; completionTokens: number } } | undefined;
+    expect(await clientB.chat(['hi'], [], undefined, undefined, undefined, undefined, { onTiming: v => { timingB = v; } }))
+      .toEqual({ action: 'skip' });
+    expect(seen[1]?.stream_options).toEqual({ include_usage: true });
+    expect(seen[2]?.stream_options).toBeUndefined();
+    expect(timingB?.usage).toEqual({ promptTokens: 400, cachedTokens: 200, completionTokens: 12 });
+
+    // 下一轮直接省略 stream_options，不再触发 400
+    expect(await clientB.chat(['hi2'], [])).toEqual({ action: 'skip' });
+    expect(seen[3]?.stream_options).toBeUndefined();
+  } finally { fetchStub.mockRestore(); resetEndpointCapabilities(); }
 });
