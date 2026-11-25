@@ -1,0 +1,43 @@
+name: macOS Fast Gate CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast-gate:
+    name: macOS Offline Build & Unit Tests
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run repository invariants and security guard
+        env:
+          CI_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+        run: bash scripts/ci-guard.sh
+
+      - name: Restore Engine dependencies for offline selftest
+        working-directory: Engine
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Run full offline package, Swift tests, and Engine tests
+        run: bash scripts/selftest.sh
