@@ -1,7 +1,23 @@
 import { IDENTITY, inspectDraft, inspectText, type DraftReviewRule, type TextReviewRule } from '../../policy.ts';
 import type { Decision } from '../../model.ts';
 import type { NormalizedEvent } from '../contracts/events.ts';
-import { riskLevel, type ConversationPolicy, type RiskLevel } from '../contracts/settings.ts';
+import { riskLevel, type ConversationPolicy, type QuietHoursConfig, type RiskLevel } from '../contracts/settings.ts';
+
+function clockMinutes(value: string): number {
+  const [h, m] = value.split(':').map(Number);
+  return (h ?? 0) * 60 + (m ?? 0);
+}
+
+/** 判定本机当前时间是否落在勿扰时间窗内；支持跨零点（如 23:00–08:00），起止相同时视为未命中。 */
+export function isInQuietHours(config: QuietHoursConfig | undefined, nowMs: number): boolean {
+  if (!config?.enabled) return false;
+  const start = clockMinutes(config.start);
+  const end = clockMinutes(config.end);
+  if (start === end) return false;
+  const d = new Date(nowMs);
+  const current = d.getHours() * 60 + d.getMinutes();
+  return start < end ? current >= start && current < end : current >= start || current < end;
+}
 
 type Action = 'lock_peer' | 'pause_session' | 'cooldown_or_pause' | 'skip_turn' | 'identity' | 'allow';
 type ReviewHit = { source: 'inbound'; rule: TextReviewRule } | { source: 'outbound'; rule: DraftReviewRule } |

@@ -320,9 +320,10 @@ final class V2ClientTests: XCTestCase {
         XCTAssertFalse(decoded.fastReplyMode)
         XCTAssertTrue(String(decoding: try IPCv3.encoder().encode(decoded), as: UTF8.self).contains(#""fastReplyMode":false"#))
 
-        let enabled = legacy.replacingOccurrences(of: #""maxConcurrentLlmCalls""#, with: #""fastReplyMode":true,"maxConcurrentLlmCalls""#)
+        let enabled = #"{"approvedCloudPresetIds":[],"autoResumeReadOnlyPlugins":false,"fastReplyMode":true,"maxConcurrentLlmCalls":3,"pinnedConversationIds":[],"quietHours":{"action":"skip_turn","enabled":false,"end":"08:00","start":"23:00"}}"#
         let value = try IPCv3.decodeStrict(SettingsV2.Runtime.self, from: Data(enabled.utf8))
         XCTAssertTrue(value.fastReplyMode)
+        XCTAssertEqual(value.quietHours, SettingsV2.QuietHours())
         XCTAssertTrue(try jsonEqual(IPCv3.encoder().encode(value), Data(enabled.utf8)))
         let null = legacy.replacingOccurrences(of: #""maxConcurrentLlmCalls""#, with: #""fastReplyMode":null,"maxConcurrentLlmCalls""#)
         XCTAssertThrowsError(try IPCv3.decodeStrict(SettingsV2.Runtime.self, from: Data(null.utf8)))

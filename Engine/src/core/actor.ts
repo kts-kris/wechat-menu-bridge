@@ -4,11 +4,11 @@ import { MAX_AGE } from '../../policy.ts';
 import { errorCode, type ErrorCode } from '../contracts/errors.ts';
 import type { NormalizedEvent } from '../contracts/events.ts';
 import type { SessionRuntimeState, SessionTraceEntry } from '../contracts/ipc.ts';
-import { riskLevel, type ConversationPolicy } from '../contracts/settings.ts';
+import { riskLevel, type ConversationPolicy, type QuietHoursConfig } from '../contracts/settings.ts';
 import { peerKey, type Receipt } from '../mcp/client.ts';
 import { eventRefHash, type EventInput, type SendFence } from '../mcp/ingest.ts';
 import type { JournalV2 } from '../storage/journal-v2.ts';
-import { manualReview, PolicyEngine, reviewDescription, type PolicyDecision } from './policy.ts';
+import { isInQuietHours, manualReview, PolicyEngine, reviewDescription, type PolicyDecision } from './policy.ts';
 import type { TransmitService } from './transmit.ts';
 
 type Timer = ReturnType<typeof setTimeout>;
@@ -19,6 +19,8 @@ type Options = {
   fence: () => Fence; generate: (turn: string[], context: Context[], grant: Grant, signal: AbortSignal) => Promise<Decision>;
   prewarm?: (grant: Grant) => void;
   capabilities?: () => { nativeReply: boolean; mentionSend: boolean };
+  quietHours?: () => QuietHoursConfig | undefined;
+  quietHoursNow?: () => number;
   onStatus?: (status: SessionRuntimeState) => void; onScheduleCancelled?: (reason: ErrorCode) => void;
   onTrace?: (stage: SessionTraceEntry['stage'], level: SessionTraceEntry['level'], summary: string, code?: ErrorCode) => void;
   workingMaxMessages?: number; workingTtlMs?: number; debounceMs?: number; batchMaxMs?: number;
@@ -66,6 +68,12 @@ export class ConversationActor {
   }
 
   private now() { return (this.options.now ?? Date.now)(); }
+  private activeQuietHoursAction(): QuietHoursConfig['action'] | undefined {
+    if (this.policy.ignoreQuietHours) return undefined;
+    const config = this.options.quietHours?.();
+    if (!config || !isInQuietHours(config, (this.options.quietHoursNow ?? this.options.now ?? Date.now)())) return undefined;
+    return config.action;
+  }
   get policy() { return this.policyValue; }
   private get riskLevel() { return riskLevel(this.policy.riskProfile); }
   get status(): SessionRuntimeState { return { ...this.statusValue }; }
@@ -309,6 +317,10 @@ export class ConversationActor {
       this.options.onTrace?.('policy', 'info', `冷静期中跳过（剩余 ${seconds}s）`);
       return false;
     }
+    if (this.activeQuietHoursAction() === 'skip_turn') {
+      this.options.onTrace?.('policy', 'info', '命中勿扰时段，已跳过本轮');
+      return false;
+    }
     if (media && (outcome.action === 'allow' || outcome.action === 'identity')) {
       this.invalidate();
       this.processingRefs.add(event.messageRef);
@@ -404,6 +416,12 @@ export class ConversationActor {
     const turn = this.queue.slice().sort((a, b) => a.createdAt - b.createdAt);
     if (!turn.length) { this.show(this.shot ? 'scheduled' : 'listening'); return; }
     if (turn.length > 4) { this.apply(this.engine.busy(this.policy)); return; }
+    if (this.activeQuietHoursAction() === 'skip_turn') {
+      this.queue = [];
+      this.options.onTrace?.('policy', 'info', '命中勿扰时段，已跳过本轮');
+      this.show(this.shot ? 'scheduled' : 'listening');
+      return;
+    }
     const revision = this.revision;
     const controller = this.generation = new AbortController();
     const check = () => {
@@ -426,7 +444,17 @@ export class ConversationActor {
       if (decision.action === 'identity' && !identity) this.options.onTrace?.('policy', 'info', '模型判定为身份询问，使用固定说明');
       const outcome = this.engine.outbound(decision, this.riskLevel);
       if (!outcome.text) { this.apply(outcome); return; }
-      if (grant.mode === 'draft') {
+      const quietAction = this.activeQuietHoursAction();
+      if (quietAction === 'skip_turn') {
+        this.queue = [];
+        this.options.onTrace?.('policy', 'info', '命中勿扰时段，已跳过本轮');
+        this.show(this.shot ? 'scheduled' : 'listening');
+        return;
+      }
+      if (grant.mode === 'draft' || quietAction === 'draft_only') {
+        if (grant.mode === 'auto' && quietAction === 'draft_only') {
+          this.options.onTrace?.('policy', 'info', '命中勿扰时段，已降级为只拟稿');
+        }
         this.queue = [];
         this.show(this.shot ? 'scheduled' : 'listening', 'draft-ready', { draft: outcome.text });
         this.draftTimer = setTimeout(() => {

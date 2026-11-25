@@ -32,6 +32,15 @@ export const modelPresetSchema = z.strictObject({
   temperature: z.number().min(0).max(2).default(0.35),
 }).transform(preset => ({ ...preset, url: modelEndpoint(preset.url, preset.kind) }));
 
+const clockTimeSchema = z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, 'Expected HH:mm');
+export const quietHoursSchema = z.strictObject({
+  enabled: z.boolean().default(false),
+  start: clockTimeSchema.default('23:00'),
+  end: clockTimeSchema.default('08:00'),
+  action: z.enum(['skip_turn', 'draft_only']).default('skip_turn'),
+});
+export type QuietHoursConfig = z.infer<typeof quietHoursSchema>;
+
 const riskLevelSchema = z.enum(['recommended', 'strict', 'minimal']);
 const riskProfileSchema = z.strictObject({
   level: riskLevelSchema.optional(),
@@ -56,6 +65,7 @@ export const conversationPolicySchema = z.strictObject({
   pluginIds: z.array(identifierSchema).default([]),
   useNativeReply: z.boolean().default(false),
   mentionReplySender: z.boolean().default(false),
+  ignoreQuietHours: z.boolean().default(false),
 }).transform(policy => ({ ...policy, memoryEnabled: policy.memoryEnabled ?? policy.type === 'direct' }));
 
 export const settingsV2Schema = z.strictObject({
@@ -92,6 +102,7 @@ export const settingsV2Schema = z.strictObject({
     approvedCloudPresetIds: z.array(identifierSchema).default([]),
     maxConcurrentLlmCalls: positiveInt.default(3),
     fastReplyMode: z.boolean().default(false),
+    quietHours: quietHoursSchema.prefault({}),
   }),
 }).refine(settings => Object.entries(settings.conversations).every(([key, value]) => key === value.conversationId), {
   path: ['conversations'],

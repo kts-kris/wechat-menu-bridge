@@ -36,6 +36,7 @@ type Options = {
   onSettingsApplied?: (settings: SettingsV2, cloudApiKeys?: Record<string, string>) => void;
   onPauseAll?: (scope: 'sending_only' | 'all') => void;
   actorTiming?: { debounceMs?: number; batchMaxMs?: number };
+  quietHoursNow?: () => number;
   shortPollMs?: number;
 };
 type Job = { conversationId: string; controller: AbortController; task: Promise<void> };
@@ -216,6 +217,8 @@ export class BridgeOrchestrator {
       workingTtlMs: this.settings.memory.workingTtlMinutes * 60_000, ...this.options.actorTiming,
       fence: () => connection.ingest.fence(id),
       capabilities: () => ({ nativeReply: this.capabilities.nativeReply, mentionSend: this.capabilities.mentionSend }),
+      quietHours: () => this.settings.runtime.quietHours,
+      quietHoursNow: this.options.quietHoursNow,
       onTrace: (stage, level, summary, code) => this.emitTrace(id, stage, level, summary, code),
       prewarm: () => {
         const current = actor?.policy ?? policy;

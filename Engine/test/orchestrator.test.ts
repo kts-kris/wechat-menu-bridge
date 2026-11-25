@@ -7,10 +7,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { BridgeError } from '../contracts.ts';
 import type { NormalizedEvent } from '../src/contracts/events.ts';
 import { pushFrameSchema, rpcReplySchema, rpcSchemas } from '../src/contracts/ipc.ts';
-import { conversationPolicySchema, settingsV2Schema } from '../src/contracts/settings.ts';
+import { conversationPolicySchema, settingsV2Schema, type QuietHoursConfig } from '../src/contracts/settings.ts';
 import { ConversationActor } from '../src/core/actor.ts';
 import { BridgeOrchestrator } from '../src/core/orchestrator.ts';
-import { PolicyEngine } from '../src/core/policy.ts';
+import { isInQuietHours, PolicyEngine } from '../src/core/policy.ts';
 import { TransmitService } from '../src/core/transmit.ts';
 import { IpcV3Router } from '../src/ipc/router-v3.ts';
 import { V3EngineApp } from '../src/ipc/v3-app.ts';
@@ -28,7 +28,10 @@ const session = (id: string, extra = {}) => conversationPolicySchema.parse({
   enabled: true, replyMode: 'off', backfillOnArmCount: 0, ...extra,
 });
 
-async function setup(config: { backfill?: number; fallback?: boolean; strictMedia?: boolean; cloudKey?: string } = {}) {
+async function setup(config: {
+  backfill?: number; fallback?: boolean; strictMedia?: boolean; cloudKey?: string;
+  quietHours?: Partial<QuietHoursConfig>; quietHoursNow?: () => number;
+} = {}) {
   const net = await mockNetwork({ v2: true });
   net.state.accountWideEvents = !config.fallback;
   const dir = testDir();
@@ -37,12 +40,14 @@ async function setup(config: { backfill?: number; fallback?: boolean; strictMedi
       schemaVersion: 2, xiaohe: { mcpUrl: net.mcp, accountId: binding.account_id, accountLabel: '测试' },
       models: [{ id: 'chat', name: 'Chat', kind: 'chat', mode: 'local', url: net.model, modelName: 'fixture' },
         { id: 'vision', name: 'Vision', kind: 'vision', mode: 'local', url: net.model, modelName: 'fixture' }],
-      defaultModels: { replyPresetId: 'chat', visionPresetId: 'vision' }, memory: {}, runtime: {},
+      defaultModels: { replyPresetId: 'chat', visionPresetId: 'vision' }, memory: {},
+      runtime: config.quietHours ? { quietHours: config.quietHours } : {},
       conversations: { [peer]: session(peer, { backfillOnArmCount: config.backfill ?? 0,
         riskProfile: { strictLegacyRules: !!config.strictMedia } }),
         [secondPeer]: session(secondPeer), [group]: session(group), [service]: session(service) },
     }),
     getModelKey: () => config.cloudKey,
+    quietHoursNow: config.quietHoursNow,
     actorTiming: { debounceMs: 120, batchMaxMs: 400 }, shortPollMs: 25,
   });
   return {
@@ -1033,5 +1038,74 @@ test('设置页默认模型试拟例句不被风控拦截，真实调用试拟�
     expect(res).toEqual({ action: 'reply', text: '哈哈，那挺好' });
     expect(t.models.length).toBe(1);
     expect(t.sends(peer).length).toBe(0);
+  } finally { await t.close(); }
+});
+
+// ---- v2.3.0 #21：勿扰时段控制 ----
+
+const localClock = (h: number, m: number) => new Date(2026, 10, 25, h, m, 0).getTime();
+
+test('v2.3 #21 isInQuietHours 正确判定同日、跨零点、关闭与空窗口', () => {
+  expect(isInQuietHours(undefined, localClock(23, 30))).toBe(false);
+  expect(isInQuietHours({ enabled: false, start: '23:00', end: '08:00', action: 'skip_turn' }, localClock(23, 30))).toBe(false);
+  expect(isInQuietHours({ enabled: true, start: '23:00', end: '23:00', action: 'skip_turn' }, localClock(23, 0))).toBe(false);
+
+  const overnight: QuietHoursConfig = { enabled: true, start: '23:00', end: '08:00', action: 'skip_turn' };
+  expect(isInQuietHours(overnight, localClock(22, 59))).toBe(false);
+  expect(isInQuietHours(overnight, localClock(23, 0))).toBe(true);
+  expect(isInQuietHours(overnight, localClock(2, 15))).toBe(true);
+  expect(isInQuietHours(overnight, localClock(7, 59))).toBe(true);
+  expect(isInQuietHours(overnight, localClock(8, 0))).toBe(false);
+
+  const midday: QuietHoursConfig = { enabled: true, start: '12:00', end: '14:00', action: 'draft_only' };
+  expect(isInQuietHours(midday, localClock(11, 59))).toBe(false);
+  expect(isInQuietHours(midday, localClock(12, 30))).toBe(true);
+  expect(isInQuietHours(midday, localClock(14, 0))).toBe(false);
+});
+
+test('v2.3 #21 勿扰时段 skip_turn 跳过不调模型、draft_only 降级仅拟稿、豁免放行且不削弱叫停锁', async () => {
+  let fakeNow = localClock(23, 30);
+  const t = await setup({
+    quietHours: { enabled: true, start: '23:00', end: '08:00', action: 'skip_turn' },
+    quietHoursNow: () => fakeNow,
+  });
+  try {
+    await t.arm(peer);
+    await t.arm(secondPeer);
+    await until(() => t.phase(peer) === 'listening' && t.phase(secondPeer) === 'listening');
+
+    // 1. skip_turn：不调模型、不发信、写脱敏轨迹
+    t.push(incoming('qh-skip-1', peer, { text: '深夜冒泡' }));
+    await until(() => t.bridge.sessionTraces({ conversationId: peer, limit: 20 }).items.some(e => e.summary === '命中勿扰时段，已跳过本轮'));
+    expect(t.models.length).toBe(0);
+    expect(t.sends(peer).length).toBe(0);
+
+    // 2. 热更新为 draft_only + 为 secondPeer 开启 ignoreQuietHours 豁免
+    const next = structuredClone(t.bridge.currentSettings);
+    next.runtime.quietHours.action = 'draft_only';
+    next.conversations[secondPeer]!.ignoreQuietHours = true;
+    await t.bridge.applySettings(next);
+
+    // peer 命中勿扰并降级为只拟稿（调模型生成草稿，但绝不发信）
+    t.push(incoming('qh-draft-1', peer, { text: '今天天气不错' }));
+    await until(() => t.bridge.status().sessions[peer]?.draft === '哈哈，那挺好');
+    expect(t.sends(peer).length).toBe(0);
+    expect(t.bridge.sessionTraces({ conversationId: peer, limit: 20 }).items.some(e => e.summary === '命中勿扰时段，已降级为只拟稿')).toBe(true);
+
+    // secondPeer 开启了 ignoreQuietHours 豁免，即使 23:30 也正常自动回复
+    t.push(incoming('qh-exempt-1', secondPeer, { text: '下楼刚好碰上有太阳' }));
+    await until(() => t.sends(secondPeer).length === 1);
+
+    // 3. 安全铁律：勿扰时段（切回 skip_turn）收到对方叫停仍必须永久锁定 peer-stopped
+    const nextSkip = structuredClone(t.bridge.currentSettings);
+    nextSkip.runtime.quietHours.action = 'skip_turn';
+    await t.bridge.applySettings(nextSkip);
+    t.push(incoming('qh-stop-1', peer, { text: '别再自动回复了' }));
+    await until(() => t.phase(peer) === 'locked-opt-out');
+    expect(t.sends(peer).length).toBe(0);
+
+    // 4. 离开勿扰时段（09:00）恢复正常
+    fakeNow = localClock(9, 0);
+    expect(isInQuietHours(t.bridge.currentSettings.runtime.quietHours, fakeNow)).toBe(false);
   } finally { await t.close(); }
 });
