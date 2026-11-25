@@ -19,7 +19,7 @@
 ## 3. 版本打包与发布规则（并非每个 Issue 关闭都打包）
 日常开发合入 `main` 与正式打版发布解耦，按以下规则触发打包：
 - **不需要发版打包**：纯文档更新（如 `README.md`、`AGENTS.md`）、Issue 模板/脚本维护、内部重构、测试补充、或尚未达到发布窗口的零散小改进——完成 UAT 并合入 `main`、关闭对应 Issue 即可。
-- **触发打版发布**（同步递增 `App/Info.plist` 版本号与构建号 → `bash scripts/selftest.sh` → `bash scripts/release-feed.sh` 生成 Ed25519 签名 `appcast.json`/`appcast.xml` → 打 Git Tag 并发布 GitHub Release）：
+- **触发打版发布**（同步递增 `App/Info.plist` 与 `FeedbackView.swift` 版本号/构建号 → `bash scripts/selftest.sh` → `bash scripts/release-feed.sh` 生成 Ed25519 签名 `appcast.json`/`appcast.xml` 并随 Release 同步附带签名 `bundles-manifest.json` 与 `model-compat.json` → 打 Git Tag 并发布 GitHub Release）：
   1. 修复影响日常使用的关键缺陷（Patch 版本，如 `v2.1.1`）；
   2. 达成阶段性功能里程碑（Minor 版本，如 `v2.2.0`）；
   3. 项目负责人明确指令发布新版本。
@@ -30,3 +30,7 @@
 3. **历史补扫绝不触发发信**：`origin === 'backfill'` 的事件仅用于上下文、只读插件与记忆整理。
 4. **绝不削弱 `Engine/test/faults.test.ts`**：保持核心故障对抗测试完整有效。
 5. **凭据隔离**：API Key 与令牌仅存本机 `0600` 私有文件（`secrets.json`）或隔离测试钥匙串，绝不写入 `settings.json`、`engine.log`、诊断报告或任何 Git 跟踪文件。
+
+## 5. 测试分层与零打扰规范（方案 A）
+- **日常开发与常规 PR 默认后台静默验收**：仅执行 `scripts/selftest.sh`（以及涉及更新器/打包时执行 `scripts/qa-upgrade.sh`），全程不抢占宿主机鼠标、键盘与窗口焦点；新增 UI 交互与渲染校验优先下沉到 `V2ViewTests` 离屏单测。
+- **原生桌面点击测试（`scripts/uitest.sh`）按需触发且跑前确认**：由于 macOS `XCUITest` 会接管当前桌面鼠标与输入焦点，仅在修改原生窗口/菜单栏交互或正式发版前按需运行，且**启动前必须先向用户确认当前是否方便**，严禁在用户工作时静默启动抢占鼠标。
