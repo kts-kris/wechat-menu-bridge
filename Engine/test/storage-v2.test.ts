@@ -107,7 +107,7 @@ test('真实 v0.2.1 SQLite 原地迁移并重复开启，保留退订、去重�
       expect(sqlite.query("SELECT value FROM schema_meta WHERE key='version'").get()).toEqual({ value: '2' });
       expect(sqlite.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").values().flat())
         .toEqual(['attempts', 'cursors', 'events', 'feed_items', 'memory_revisions', 'memory_watermarks', 'opted_out',
-          'pending_drains', 'persona_proposals', 'plugin_buffers', 'plugin_runs', 'plugin_state', 'schema_meta', 'timings']);
+          'pending_drains', 'persona_proposals', 'plugin_buffers', 'plugin_runs', 'plugin_state', 'schema_meta', 'timings', 'turn_metrics']);
       sqlite.run("UPDATE schema_meta SET value='3' WHERE key='version'");
     } finally { sqlite.close(); }
     expect(() => new JournalV2(dir)).toThrow('storage-unavailable');
@@ -304,10 +304,12 @@ test('事件、插件与 IPC v3 契约保留实际字段并验证方法对应载
   expect(groupDigestOutputSchema.safeParse({ skip: true }).success).toBe(true);
   expect(groupDigestOutputSchema.safeParse({ skip: false, headline: '缺少结构化字段' }).success).toBe(false);
   expect(MAX_FRAME_BYTES).toBe(262_144);
-  expect(PUSH_TOPICS).toHaveLength(8);
+  expect(PUSH_TOPICS).toHaveLength(9);
   expect(PUSH_TOPICS).toContain('session.trace');
-  expect(RPC_METHODS).toHaveLength(37);
+  expect(PUSH_TOPICS).toContain('metrics.updated');
+  expect(RPC_METHODS).toHaveLength(38);
   expect(RPC_METHODS).toContain('policy.evaluate');
+  expect(RPC_METHODS).toContain('system.metrics');
   expect(RPC_METHODS).toContain('system.bundles');
   expect(RPC_METHODS).toContain('plugins.testWebhook');
   expect(RPC_METHODS).toEqual(expect.arrayContaining(['session.traces', 'session.resumeCooldown', 'system.healthCheck']));

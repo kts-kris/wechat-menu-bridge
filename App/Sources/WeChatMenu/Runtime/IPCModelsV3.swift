@@ -847,6 +847,73 @@ struct SessionTraceEntry: Codable, Equatable, Identifiable, Sendable {
     var detail: String? = nil
 }
 
+enum PerfStage: String, Codable, CaseIterable, Identifiable, Sendable {
+    case ingest, debounce, prompt
+    case modelTtft = "model_ttft"
+    case modelGen = "model_gen"
+    case send
+
+    var id: String { rawValue }
+}
+
+enum TurnPerfOutcome: String, Codable, CaseIterable, Sendable {
+    case sent, draft, identity, skipped, failed
+}
+
+struct TurnPerfSample: Codable, Equatable, Identifiable, Sendable {
+    var id: String
+    var conversationId: String
+    var at: Int64
+    var outcome: TurnPerfOutcome
+    var ingestMs: Int
+    var debounceMs: Int
+    var promptMs: Int
+    var promptCacheHit: Bool
+    var modelTtftMs: Int
+    var modelTotalMs: Int
+    var fenceMs: Int
+    var sendWireMs: Int
+    var totalMs: Int
+    var bottleneck: PerfStage
+    var modelMode: ModelMode? = nil
+    var effort: ReasoningEffort? = nil
+    var fallbackUsed: Bool
+    var errorCode: IPCErrorCode? = nil
+
+    var modelGenMs: Int { max(0, modelTotalMs - modelTtftMs) }
+    var sendTotalMs: Int { fenceMs + sendWireMs }
+}
+
+struct PerfStageSummary: Codable, Equatable, Identifiable, Sendable {
+    var stage: PerfStage
+    var p50Ms: Int
+    var p95Ms: Int
+    var avgMs: Int
+    var sharePercent: Int
+    var bottleneckCount: Int
+    var id: String { stage.rawValue }
+
+    private enum CodingKeys: String, CodingKey { case stage, p50Ms, p95Ms, avgMs, sharePercent, bottleneckCount }
+}
+
+struct SystemMetricsResult: Codable, Equatable, Sendable {
+    struct Total: Codable, Equatable, Sendable {
+        var p50Ms: Int
+        var p95Ms: Int
+        var maxMs: Int
+        var avgMs: Int
+    }
+    var windowHours: Int
+    var sampleCount: Int
+    var slowCount: Int
+    var slowThresholdMs: Int
+    var promptCacheHitCount: Int
+    var total: Total
+    var primaryBottleneck: PerfStage? = nil
+    var stages: [PerfStageSummary]
+    var recent: [TurnPerfSample]
+}
+
 struct HealthCheckStep: Codable, Equatable, Identifiable, Sendable {
     enum StepID: String, Codable, CaseIterable, Sendable { case xiaohe, whitelist, credentials, model }
     var id: StepID
@@ -900,7 +967,7 @@ struct SystemStatus: Codable, Equatable, Sendable {
 enum PushTopic: String, Codable, CaseIterable, Sendable {
     case hello, sessionUpdated = "session.updated", globalUpdated = "global.updated", feedAdded = "feed.added"
     case pluginUpdated = "plugin.updated", proposalUpdated = "proposal.updated", backfillProgress = "backfill.progress"
-    case sessionTrace = "session.trace"
+    case sessionTrace = "session.trace", metricsUpdated = "metrics.updated"
 }
 
 struct HelloPayload: Codable, Equatable, Sendable {
@@ -926,6 +993,7 @@ struct FeedAdded: Codable, Equatable, Sendable { var item: FeedItem; var notifyD
 struct PluginUpdate: Codable, Equatable, Sendable { var pluginId: String; var state: PluginRuntimeState }
 struct ProposalUpdate: Codable, Equatable, Sendable { var pendingCount: Int; var latestProposal: PersonaProposal? = nil }
 private struct SessionTracePayload: Codable { var entry: SessionTraceEntry }
+private struct MetricsUpdatedPayload: Codable { var sample: TurnPerfSample }
 
 enum PushEvent: Codable, Equatable, Sendable {
     case hello(HelloPayload)
@@ -936,6 +1004,7 @@ enum PushEvent: Codable, Equatable, Sendable {
     case proposalUpdated(ProposalUpdate)
     case backfillProgress(BackfillProgress)
     case sessionTrace(SessionTraceEntry)
+    case metricsUpdated(TurnPerfSample)
 
     private enum CodingKeys: String, CodingKey { case v, kind, topic, payload }
 
@@ -949,6 +1018,7 @@ enum PushEvent: Codable, Equatable, Sendable {
         case .proposalUpdated: return .proposalUpdated
         case .backfillProgress: return .backfillProgress
         case .sessionTrace: return .sessionTrace
+        case .metricsUpdated: return .metricsUpdated
         }
     }
 
@@ -966,6 +1036,7 @@ enum PushEvent: Codable, Equatable, Sendable {
         case .proposalUpdated: self = .proposalUpdated(try c.decode(ProposalUpdate.self, forKey: .payload))
         case .backfillProgress: self = .backfillProgress(try c.decode(BackfillProgress.self, forKey: .payload))
         case .sessionTrace: self = .sessionTrace(try c.decode(SessionTracePayload.self, forKey: .payload).entry)
+        case .metricsUpdated: self = .metricsUpdated(try c.decode(MetricsUpdatedPayload.self, forKey: .payload).sample)
         }
     }
 
@@ -983,6 +1054,7 @@ enum PushEvent: Codable, Equatable, Sendable {
         case .proposalUpdated(let payload): try c.encode(payload, forKey: .payload)
         case .backfillProgress(let payload): try c.encode(payload, forKey: .payload)
         case .sessionTrace(let entry): try c.encode(SessionTracePayload(entry: entry), forKey: .payload)
+        case .metricsUpdated(let sample): try c.encode(MetricsUpdatedPayload(sample: sample), forKey: .payload)
         }
     }
 }
@@ -1260,7 +1332,7 @@ struct MemoryRevision: Codable, Equatable, Identifiable, Sendable {
 // MARK: - RPC 方法与参数
 
 enum RPCMethod: String, Codable, CaseIterable, Sendable {
-    case systemStatus = "system.status", systemPauseAll = "system.pauseAll", systemHealthCheck = "system.healthCheck"
+    case systemStatus = "system.status", systemMetrics = "system.metrics", systemPauseAll = "system.pauseAll", systemHealthCheck = "system.healthCheck"
     case systemBundles = "system.bundles"
     case xiaoheAccounts = "xiaohe.accounts", xiaoheConversations = "xiaohe.conversations"
     case xiaoheGroupMembers = "xiaohe.groupMembers", xiaoheCapabilities = "xiaohe.capabilities"
@@ -1337,6 +1409,11 @@ enum RPCParams {
         func encode(to encoder: Encoder) throws { _ = encoder.container(keyedBy: IPCCodingKey.self) }
     }
     struct PauseAll: Encodable { let scope: PauseScope; let reason: IPCErrorCode }
+    struct SystemMetrics: Encodable {
+        var windowHours: Int? = nil
+        var conversationId: String? = nil
+        var recentLimit: Int? = nil
+    }
     struct Bundles: Encodable {
         let action: HotBundlesAction
         var manifestUrl: String? = nil

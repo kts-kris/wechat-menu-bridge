@@ -11,10 +11,20 @@ type Priority = 'reply' | 'background';
 export type ModelRequest = {
   priority?: Priority; signal?: AbortSignal; cloudApproved?: boolean; apiKey?: string; style?: string; memory?: string;
 };
+export type ChatTurnTiming = {
+  promptMs: number;
+  promptCacheHit: boolean;
+  ttftMs: number;
+  modelTotalMs: number;
+  modelMode: 'local' | 'cloud';
+  effort: ModelTiming['effort'];
+  fallbackUsed: boolean;
+};
 type ChatRequest = ModelRequest & {
   fallbackPresetId?: string; fallbackCloudApproved?: boolean; onTrace?: ModelTrace;
   fastReplyMode?: boolean; includeEmptyContext?: boolean;
-  profileForMode?: (mode: ModelPreset['mode']) => Promise<{ style?: string; memory?: string }>;
+  profileForMode?: (mode: ModelPreset['mode']) => Promise<{ style?: string; memory?: string; cacheHit?: boolean; promptMs?: number }>;
+  onTurnTiming?: (timing: ChatTurnTiming) => void;
 };
 type Ticket = { priority: Priority; start: () => void };
 export type KeyProvider = (preset: ModelPreset) => string | undefined | Promise<string | undefined>;
@@ -114,9 +124,13 @@ export class ModelRouter {
   }
 
   async chat(id: string, turn: readonly string[], context: readonly Context[], options: ChatRequest = {}) {
-    const { fallbackPresetId, fallbackCloudApproved, onTrace, profileForMode, signal } = options;
+    const { fallbackPresetId, fallbackCloudApproved, onTrace, profileForMode, onTurnTiming, signal } = options;
     const started = performance.now();
     let timing: ModelTiming | undefined;
+    let promptMs = 0;
+    let promptCacheHit = false;
+    let activeMode: 'local' | 'cloud' = this.presets.get(id)?.mode ?? 'local';
+    let fallbackUsed = false;
     const primary = this.presets.get(id);
     const fallback = fallbackPresetId && this.presets.get(fallbackPresetId);
     const eligible = fallback && fallback.id !== id && fallback.kind === 'chat' && (fallback.mode === 'local' || fallbackCloudApproved)
@@ -129,12 +143,16 @@ export class ModelRouter {
       try {
         return await this.model(preset, 'chat', { priority: 'reply', ...request, signal: attemptSignal }, async client => {
           const mode = client.mode;
+          activeMode = mode;
+          const promptStarted = performance.now();
           const profile = profileForMode ? await untilAborted(profileForMode(mode), attemptSignal) :
             (preset === primary || primary?.mode === mode ? { style: request.style, memory: request.memory } : undefined);
+          promptMs = profile?.promptMs ?? Math.max(0, Math.round(performance.now() - promptStarted));
+          promptCacheHit = profile?.cacheHit === true;
           const remaining = Math.max(1, Math.floor(started + budget - performance.now()));
           return client.chat(turn, mode === 'cloud' ? context.slice(-12) : context, attemptSignal, profile, remaining, onTrace, {
             fastReplyMode: options.fastReplyMode, includeEmptyContext: options.includeEmptyContext,
-            onTiming: onTrace ? value => { timing = value; } : undefined,
+            onTiming: value => { timing = value; },
           });
         });
       } catch (error) {
@@ -151,14 +169,35 @@ export class ModelRouter {
         const code = errorCode(error);
         if (signal?.aborted || !eligible || this.presets.get(eligible.id) !== eligible ||
           !['model-timeout', 'model-unavailable', 'model-limit', 'model-format'].includes(code)) throw error;
+        fallbackUsed = true;
         onTrace?.('warn', '主模型异常，已切换备用模型', code);
         decision = await execute(eligible, { ...options, apiKey: undefined, cloudApproved: fallbackCloudApproved }, CHAT_TIMEOUT_MS);
       }
       const labels = { reply: '回复', skip: '跳过', manual: '转人工', stop: '停止回复', identity: '说明身份' };
       if (timing) onTrace?.('info', `模型决策：${labels[decision.action]}（首包 ${timing.firstByteMs}ms / 共 ${timing.totalMs}ms · effort=${timing.effort}）`);
+      onTurnTiming?.({
+        promptMs,
+        promptCacheHit,
+        ttftMs: timing?.firstByteMs ?? 0,
+        modelTotalMs: timing?.totalMs ?? Math.max(0, Math.round(performance.now() - started) - promptMs),
+        modelMode: activeMode,
+        effort: timing?.effort ?? 'default',
+        fallbackUsed,
+      });
       return decision;
     } catch (error) {
-      if (!signal?.aborted) onTrace?.('error', '模型调用失败', errorCode(error));
+      if (!signal?.aborted) {
+        onTrace?.('error', '模型调用失败', errorCode(error));
+        onTurnTiming?.({
+          promptMs,
+          promptCacheHit,
+          ttftMs: timing?.firstByteMs ?? 0,
+          modelTotalMs: timing?.totalMs ?? Math.max(0, Math.round(performance.now() - started) - promptMs),
+          modelMode: activeMode,
+          effort: timing?.effort ?? 'default',
+          fallbackUsed,
+        });
+      }
       throw error;
     }
   }

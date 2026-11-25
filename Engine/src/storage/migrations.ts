@@ -150,6 +150,29 @@ CREATE TABLE IF NOT EXISTS memory_watermarks (
   pending_turns INTEGER NOT NULL DEFAULT 0,
   last_consolidated_at INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS turn_metrics (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  outcome TEXT NOT NULL,
+  ingest_ms INTEGER NOT NULL,
+  debounce_ms INTEGER NOT NULL,
+  prompt_ms INTEGER NOT NULL,
+  prompt_cache_hit INTEGER NOT NULL DEFAULT 0,
+  model_ttft_ms INTEGER NOT NULL,
+  model_total_ms INTEGER NOT NULL,
+  fence_ms INTEGER NOT NULL,
+  send_wire_ms INTEGER NOT NULL,
+  total_ms INTEGER NOT NULL,
+  bottleneck TEXT NOT NULL,
+  model_mode TEXT,
+  effort TEXT,
+  fallback_used INTEGER NOT NULL DEFAULT 0,
+  error_code TEXT
+);
+CREATE INDEX IF NOT EXISTS turn_metrics_time ON turn_metrics(at DESC);
+CREATE INDEX IF NOT EXISTS turn_metrics_conv ON turn_metrics(conversation_id, at DESC);
 `;
 
 const addedColumns = {

@@ -86,6 +86,8 @@ final class SessionsStore: ObservableObject, BridgeEventConsumer {
     @Published private(set) var backfills: [String: BackfillProgress] = [:]
     // 每会话最多 40 条，最新在前。
     @Published private(set) var traces: [String: [SessionTraceEntry]] = [:]
+    @Published private(set) var metrics: SystemMetricsResult?
+    @Published var metricsWindowHours: Int = 24
     @Published private(set) var authorizing: Set<String> = []
     @Published private(set) var account: XiaoheAccountOption?
 
@@ -111,6 +113,11 @@ final class SessionsStore: ObservableObject, BridgeEventConsumer {
         case .sessionUpdated(let update): sessions[update.conversationId] = update.status
         case .backfillProgress(let progress): backfills[progress.jobId] = progress
         case .sessionTrace(let entry): mergeTraces([entry], for: entry.conversationId)
+        case .metricsUpdated:
+            let hours = metricsWindowHours
+            Task { @MainActor [weak self] in
+                try? await self?.loadMetrics(windowHours: hours)
+            }
         default: break
         }
     }
@@ -119,6 +126,7 @@ final class SessionsStore: ObservableObject, BridgeEventConsumer {
         sessions = [:]
         backfills = [:]
         traces = [:]
+        metrics = nil
         tokens = [:]
         authorizing = []
         account = nil
@@ -274,6 +282,12 @@ final class SessionsStore: ObservableObject, BridgeEventConsumer {
     func loadTraces(for conversationId: String) async throws {
         let items = try await runtime.client.sessionTraces(conversationId: conversationId, limit: Self.maxTraces)
         mergeTraces(items.filter { $0.conversationId == conversationId }, for: conversationId)
+    }
+
+    func loadMetrics(windowHours: Int? = nil, conversationId: String? = nil) async throws {
+        let hours = windowHours ?? metricsWindowHours
+        metricsWindowHours = hours
+        metrics = try await runtime.client.systemMetrics(.init(windowHours: hours, conversationId: conversationId, recentLimit: 20))
     }
 
     // 推送可能早于响应到达，这里按 id 合并而不是整体覆盖。

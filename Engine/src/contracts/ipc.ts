@@ -102,10 +102,67 @@ export const healthCheckStepSchema = z.strictObject({
 });
 export type HealthCheckStep = z.infer<typeof healthCheckStepSchema>;
 
+export const perfStageSchema = z.enum(['ingest', 'debounce', 'prompt', 'model_ttft', 'model_gen', 'send']);
+export type PerfStage = z.infer<typeof perfStageSchema>;
+
+export const turnPerfOutcomeSchema = z.enum(['sent', 'draft', 'identity', 'skipped', 'failed']);
+export type TurnPerfOutcome = z.infer<typeof turnPerfOutcomeSchema>;
+
+export const turnPerfSampleSchema = z.strictObject({
+  id: identifierSchema,
+  conversationId: identifierSchema,
+  at: timestampSchema,
+  outcome: turnPerfOutcomeSchema,
+  ingestMs: count,
+  debounceMs: count,
+  promptMs: count,
+  promptCacheHit: z.boolean(),
+  modelTtftMs: count,
+  modelTotalMs: count,
+  fenceMs: count,
+  sendWireMs: count,
+  totalMs: count,
+  bottleneck: perfStageSchema,
+  modelMode: z.enum(['local', 'cloud']).optional(),
+  effort: z.enum(['default', 'low', 'medium', 'high', 'max']).optional(),
+  fallbackUsed: z.boolean(),
+  errorCode: errorCodeSchema.optional(),
+});
+export type TurnPerfSample = z.infer<typeof turnPerfSampleSchema>;
+
+export const perfStageSummarySchema = z.strictObject({
+  stage: perfStageSchema,
+  p50Ms: count,
+  p95Ms: count,
+  avgMs: count,
+  sharePercent: z.number().int().min(0).max(100),
+  bottleneckCount: count,
+});
+export type PerfStageSummary = z.infer<typeof perfStageSummarySchema>;
+
+export const systemMetricsResultSchema = z.strictObject({
+  windowHours: z.number().int().min(1).max(336),
+  sampleCount: count,
+  slowCount: count,
+  slowThresholdMs: count,
+  promptCacheHitCount: count,
+  total: z.strictObject({
+    p50Ms: count,
+    p95Ms: count,
+    maxMs: count,
+    avgMs: count,
+  }),
+  primaryBottleneck: perfStageSchema.optional(),
+  stages: z.array(perfStageSummarySchema),
+  recent: z.array(turnPerfSampleSchema),
+});
+export type SystemMetricsResult = z.infer<typeof systemMetricsResultSchema>;
+
 export const pushPayloadSchemas = {
   hello: status.extend({ v: z.literal(IPC_VERSION) }),
   'session.updated': session.extend({ status: sessionRuntimeStateSchema }),
   'session.trace': z.strictObject({ entry: sessionTraceEntrySchema }),
+  'metrics.updated': z.strictObject({ sample: turnPerfSampleSchema }),
   'global.updated': globalState,
   'feed.added': z.strictObject({ item: feedItemSchema, notifyDesktop: z.boolean() }),
   'plugin.updated': plugin.extend({ state: pluginRuntimeStateSchema }),
@@ -197,6 +254,14 @@ export type PolicyEvaluateResult = z.infer<typeof policyEvaluateResultSchema>;
 
 export const rpcSchemas = {
   'system.status': { params: empty, result: status },
+  'system.metrics': {
+    params: z.strictObject({
+      windowHours: z.number().int().min(1).max(336).optional(),
+      conversationId: identifierSchema.optional(),
+      recentLimit: z.number().int().min(1).max(50).optional(),
+    }),
+    result: systemMetricsResultSchema,
+  },
   'system.bundles': {
     params: z.strictObject({
       action: z.enum(['status', 'reload', 'sync', 'reset']),

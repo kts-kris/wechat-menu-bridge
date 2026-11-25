@@ -237,10 +237,14 @@ final class BridgeClientV3 {
     }
 }
 
-// MARK: - 37 个强类型 RPC
+// MARK: - 38 个强类型 RPC
 
 extension BridgeClientV3 {
     func systemStatus() async throws -> SystemStatus { try await call(.systemStatus, RPCParams.Empty()) }
+
+    func systemMetrics(_ params: RPCParams.SystemMetrics = .init()) async throws -> SystemMetricsResult {
+        try await call(.systemMetrics, params)
+    }
 
     func systemPauseAll(scope: PauseScope, reason: IPCErrorCode) async throws {
         let _: IPCAck = try await call(.systemPauseAll, RPCParams.PauseAll(scope: scope, reason: reason))

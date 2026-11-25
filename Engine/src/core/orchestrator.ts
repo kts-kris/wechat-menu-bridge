@@ -220,6 +220,10 @@ export class BridgeOrchestrator {
       quietHours: () => this.settings.runtime.quietHours,
       quietHoursNow: this.options.quietHoursNow,
       onTrace: (stage, level, summary, code) => this.emitTrace(id, stage, level, summary, code),
+      onMetric: sample => {
+        this.journal.recordTurnMetric(sample);
+        void this.bus.publish('metrics.updated', { sample });
+      },
       prewarm: () => {
         const current = actor?.policy ?? policy;
         try {
@@ -227,7 +231,7 @@ export class BridgeOrchestrator {
           void this.assemblePromptCached(current, preset.mode).catch(() => {});
         } catch { /* 预热失败交由正式生成处理 */ }
       },
-      generate: async (turn, context, grant, signal) => {
+      generate: async (turn, context, grant, signal, onTurnTiming) => {
         const current = actor?.policy ?? policy;
         const preset = this.replyPreset(current);
         return this.models.chat(preset.id, turn, context, {
@@ -236,6 +240,7 @@ export class BridgeOrchestrator {
           ...this.fallbackOptions(this.settings),
           profileForMode: mode => this.assemblePromptCached(actor?.policy ?? policy, mode),
           onTrace: (level, summary, code) => this.emitTrace(id, 'model', level, summary, code),
+          onTurnTiming,
         });
       },
       onStatus: status => {
@@ -258,18 +263,21 @@ export class BridgeOrchestrator {
     return actor;
   }
 
-  private assemblePromptCached(policy: ConversationPolicy, mode: 'local' | 'cloud'): Promise<{ style?: string; memory?: string }> {
-    if (!this.options.assemblePrompt) return Promise.resolve({});
+  private assemblePromptCached(policy: ConversationPolicy, mode: 'local' | 'cloud'): Promise<{ style?: string; memory?: string; cacheHit?: boolean; promptMs?: number }> {
+    if (!this.options.assemblePrompt) return Promise.resolve({ cacheHit: false, promptMs: 0 });
     const key = `${policy.conversationId}:${mode}`;
     const now = Date.now();
     const cached = this.promptCache.get(key);
-    if (cached && now - cached.at <= 3000) return cached.task;
+    if (cached && now - cached.at <= 3000) {
+      return cached.task.then(value => ({ ...value, cacheHit: true, promptMs: 0 }));
+    }
+    const started = performance.now();
     const task = this.options.assemblePrompt(policy, mode).catch(error => {
       if (this.promptCache.get(key)?.task === task) this.promptCache.delete(key);
       throw error;
     });
     this.promptCache.set(key, { at: now, task });
-    return task;
+    return task.then(value => ({ ...value, cacheHit: false, promptMs: Math.max(0, Math.round(performance.now() - started)) }));
   }
 
   invalidatePromptCache() { this.promptCache.clear(); }
@@ -421,6 +429,14 @@ export class BridgeOrchestrator {
     }));
     return { capabilities: this.capabilities, globalPhase: global.phase, sessions,
       plugins: extra?.plugins ?? {}, unreadFeedCount: this.countFeed(), pendingProposalCount: extra?.pendingProposalCount ?? 0 };
+  }
+
+  systemMetrics(params: RpcParams<'system.metrics'> = {}): RpcResult<'system.metrics'> {
+    return this.journal.queryTurnMetrics({
+      windowHours: params.windowHours,
+      conversationId: params.conversationId,
+      recentLimit: params.recentLimit,
+    });
   }
 
   private statusContributor?: StatusContributor;

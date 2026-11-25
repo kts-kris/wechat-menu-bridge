@@ -65,6 +65,27 @@ struct DiagnosticSnapshot: Equatable {
         let reasoningEffort: ReasoningEffort?
     }
 
+    struct PerfSummary: Equatable {
+        let windowHours: Int
+        let sampleCount: Int
+        let slowCount: Int
+        let p50Ms: Int
+        let p95Ms: Int
+        let maxMs: Int
+        let primaryBottleneck: PerfStage?
+        let stageShares: [(stage: PerfStage, sharePercent: Int, p50Ms: Int, p95Ms: Int)]
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.windowHours == rhs.windowHours && lhs.sampleCount == rhs.sampleCount && lhs.slowCount == rhs.slowCount
+                && lhs.p50Ms == rhs.p50Ms && lhs.p95Ms == rhs.p95Ms && lhs.maxMs == rhs.maxMs
+                && lhs.primaryBottleneck == rhs.primaryBottleneck
+                && lhs.stageShares.count == rhs.stageShares.count
+                && zip(lhs.stageShares, rhs.stageShares).allSatisfy {
+                    $0.stage == $1.stage && $0.sharePercent == $1.sharePercent && $0.p50Ms == $1.p50Ms && $0.p95Ms == $1.p95Ms
+                }
+        }
+    }
+
     var appVersion = AppVersion.display
     var osVersion = ProcessInfo.processInfo.operatingSystemVersionString
     var architecture = DiagnosticBundleBuilder.architecture
@@ -76,6 +97,7 @@ struct DiagnosticSnapshot: Equatable {
     var capabilities: XiaoheCapabilities?
     var sessions: [Session] = []
     var models: [Model] = []
+    var perfSummary: PerfSummary? = nil
 
     @MainActor
     static func capture(_ workspace: V2Workspace) -> Self {
@@ -86,10 +108,20 @@ struct DiagnosticSnapshot: Equatable {
             return Session(tail: DiagnosticBundleBuilder.conversationTail(policy.conversationId), type: policy.type,
                            phase: state?.phase ?? .idle, replyMode: state?.replyMode ?? .off, reason: state?.reason?.rawValue)
         }.sorted { $0.tail < $1.tail }
+        let perf = workspace.sessions.metrics.flatMap { m -> PerfSummary? in
+            guard m.sampleCount > 0 else { return nil }
+            return PerfSummary(
+                windowHours: m.windowHours, sampleCount: m.sampleCount, slowCount: m.slowCount,
+                p50Ms: m.total.p50Ms, p95Ms: m.total.p95Ms, maxMs: m.total.maxMs,
+                primaryBottleneck: m.primaryBottleneck,
+                stageShares: m.stages.map { ($0.stage, $0.sharePercent, $0.p50Ms, $0.p95Ms) }
+            )
+        }
         return Self(backendReady: workspace.runtime.ready, globalPhase: workspace.runtime.globalPhase,
                     xiaoheConfigured: !saved.xiaohe.mcpUrl.isEmpty, accountBound: !saved.xiaohe.accountId.isEmpty,
                     capabilities: workspace.runtime.capabilities, sessions: sessions,
-                    models: saved.models.map { Model(mode: $0.mode, kind: $0.kind, reasoningEffort: $0.reasoningEffort) })
+                    models: saved.models.map { Model(mode: $0.mode, kind: $0.kind, reasoningEffort: $0.reasoningEffort) },
+                    perfSummary: perf)
     }
 }
 
@@ -193,6 +225,16 @@ enum DiagnosticBundleBuilder {
         out += ["", "## 模型（\(snapshot.models.count)）"]
         out += snapshot.models.isEmpty ? ["- 无"] : snapshot.models.map { row in
             "- \(row.mode.rawValue) · \(row.kind.rawValue) · 推理强度 \(row.reasoningEffort?.rawValue ?? "默认")"
+        }
+        if let perf = snapshot.perfSummary {
+            out += ["", "## 性能画像（最近 \(perf.windowHours) 小时，\(perf.sampleCount) 轮）",
+                    "- 端到端耗时：P50 \(perf.p50Ms)ms · P95 \(perf.p95Ms)ms · Max \(perf.maxMs)ms · 慢轮次 \(perf.slowCount)"]
+            if let bottleneck = perf.primaryBottleneck {
+                out.append("- 当前主瓶颈：\(bottleneck.title)（\(bottleneck.rawValue)）")
+            }
+            for item in perf.stageShares {
+                out.append("- \(item.stage.title)：占比 \(item.sharePercent)% · P50 \(item.p50Ms)ms · P95 \(item.p95Ms)ms")
+            }
         }
         let recent = logLines.suffix(logLineLimit)
         let clean = recent.compactMap(sanitizedLogLine)

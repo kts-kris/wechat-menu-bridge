@@ -1,13 +1,15 @@
+import { randomUUID } from 'node:crypto';
 import { BridgeError, id, sha, tomorrow } from '../../contracts.ts';
 import type { Context, Decision } from '../../model.ts';
 import { MAX_AGE } from '../../policy.ts';
 import { errorCode, type ErrorCode } from '../contracts/errors.ts';
 import type { NormalizedEvent } from '../contracts/events.ts';
-import type { SessionRuntimeState, SessionTraceEntry } from '../contracts/ipc.ts';
+import type { SessionRuntimeState, SessionTraceEntry, TurnPerfSample } from '../contracts/ipc.ts';
 import { riskLevel, type ConversationPolicy, type QuietHoursConfig } from '../contracts/settings.ts';
+import type { ChatTurnTiming } from '../llm/router.ts';
 import { peerKey, type Receipt } from '../mcp/client.ts';
 import { eventRefHash, type EventInput, type SendFence } from '../mcp/ingest.ts';
-import type { JournalV2 } from '../storage/journal-v2.ts';
+import { classifyTurnBottleneck, type JournalV2 } from '../storage/journal-v2.ts';
 import { isInQuietHours, manualReview, PolicyEngine, reviewDescription, type PolicyDecision } from './policy.ts';
 import type { TransmitService } from './transmit.ts';
 
@@ -16,13 +18,18 @@ type Grant = { mode: 'draft' | 'auto'; cloudApproved?: boolean; apiKey?: string 
 type Fence = SendFence & { identity: string };
 type Options = {
   accountId: string; journal: JournalV2; transmitter: TransmitService;
-  fence: () => Fence; generate: (turn: string[], context: Context[], grant: Grant, signal: AbortSignal) => Promise<Decision>;
+  fence: () => Fence;
+  generate: (
+    turn: string[], context: Context[], grant: Grant, signal: AbortSignal,
+    onTurnTiming?: (timing: ChatTurnTiming) => void,
+  ) => Promise<Decision>;
   prewarm?: (grant: Grant) => void;
   capabilities?: () => { nativeReply: boolean; mentionSend: boolean };
   quietHours?: () => QuietHoursConfig | undefined;
   quietHoursNow?: () => number;
   onStatus?: (status: SessionRuntimeState) => void; onScheduleCancelled?: (reason: ErrorCode) => void;
   onTrace?: (stage: SessionTraceEntry['stage'], level: SessionTraceEntry['level'], summary: string, code?: ErrorCode) => void;
+  onMetric?: (sample: TurnPerfSample) => void;
   workingMaxMessages?: number; workingTtlMs?: number; debounceMs?: number; batchMaxMs?: number;
   now?: () => number;
 };
@@ -53,6 +60,7 @@ export class ConversationActor {
   private revision = 0;
   private prewarmedRevision?: number;
   private lastEnqueuedAt?: number;
+  private firstEnqueuedPerfMs?: number;
   private firstEnqueuedAfterGap = false;
   private since?: number;
   private replyAfter = 0;
@@ -371,7 +379,10 @@ export class ConversationActor {
     this.invalidate();
     this.clearDraft();
     const now = this.now();
-    if (!this.queue.length) this.firstEnqueuedAfterGap = now - (this.lastEnqueuedAt ?? -Infinity) > 1200;
+    if (!this.queue.length) {
+      this.firstEnqueuedAfterGap = now - (this.lastEnqueuedAt ?? -Infinity) > 1200;
+      this.firstEnqueuedPerfMs = performance.now();
+    }
     this.lastEnqueuedAt = now;
     this.queue.push(event);
     if (this.queue.length > 8) this.apply(this.engine.busy(this.policy));
@@ -441,6 +452,44 @@ export class ConversationActor {
       return;
     }
     const revision = this.revision;
+    const respondStartedPerfMs = performance.now();
+    const earliest = turn[0]!;
+    const ingestMs = Math.max(0, Math.min(MAX_AGE, earliest.seenAt - earliest.createdAt));
+    const debounceMs = this.firstEnqueuedPerfMs !== undefined
+      ? Math.max(0, Math.round(respondStartedPerfMs - this.firstEnqueuedPerfMs))
+      : Math.max(0, now - earliest.seenAt);
+    let modelTiming: ChatTurnTiming | undefined;
+    let sendTiming: { fenceMs: number; wireMs: number } | undefined;
+    const emitMetric = (outcome: TurnPerfSample['outcome'], errorCodeValue?: ErrorCode) => {
+      if (!this.options.onMetric) return;
+      const promptMs = modelTiming?.promptMs ?? 0;
+      const modelTtftMs = modelTiming?.ttftMs ?? 0;
+      const modelTotalMs = modelTiming?.modelTotalMs ?? 0;
+      const fenceMs = sendTiming?.fenceMs ?? 0;
+      const sendWireMs = sendTiming?.wireMs ?? 0;
+      const activeMs = Math.max(0, Math.round(performance.now() - respondStartedPerfMs));
+      const totalMs = Math.max(ingestMs + debounceMs + activeMs, ingestMs + debounceMs + promptMs + modelTotalMs + fenceMs + sendWireMs);
+      const sample: TurnPerfSample = {
+        id: randomUUID(),
+        conversationId: this.policy.conversationId,
+        at: this.now(),
+        outcome,
+        ingestMs,
+        debounceMs,
+        promptMs,
+        promptCacheHit: modelTiming?.promptCacheHit ?? false,
+        modelTtftMs,
+        modelTotalMs,
+        fenceMs,
+        sendWireMs,
+        totalMs,
+        bottleneck: classifyTurnBottleneck({ ingestMs, debounceMs, promptMs, modelTtftMs, modelTotalMs, fenceMs, sendWireMs }),
+        ...(modelTiming && { modelMode: modelTiming.modelMode, effort: modelTiming.effort }),
+        fallbackUsed: modelTiming?.fallbackUsed ?? false,
+        ...(errorCodeValue && { errorCode: errorCodeValue }),
+      };
+      try { this.options.onMetric(sample); } catch { /* 性能指标采集绝不干扰主流程 */ }
+    };
     const controller = this.generation = new AbortController();
     const check = () => {
       this.valid(revision);
@@ -458,14 +507,21 @@ export class ConversationActor {
       const ruleDraftHit = turn.map(event => this.engine.inbound(event, this.policy, false)).find(d => d.action === 'draft_only');
       if (identity) this.options.onTrace?.('policy', 'info', '命中身份询问，使用固定说明');
       const decision = identity ? { action: 'identity' as const } :
-        await this.options.generate(turn.map(event => this.formatForModel(event)), context, grant, controller.signal);
+        await this.options.generate(turn.map(event => this.formatForModel(event)), context, grant, controller.signal, value => {
+          modelTiming = value;
+        });
       check();
       if (decision.action === 'identity' && !identity) this.options.onTrace?.('policy', 'info', '模型判定为身份询问，使用固定说明');
       const outcome = this.engine.outbound(decision, this.riskLevel);
-      if (!outcome.text) { this.apply(outcome); return; }
+      if (!outcome.text) {
+        emitMetric('skipped', outcome.reason);
+        this.apply(outcome);
+        return;
+      }
       const quietAction = this.activeQuietHoursAction();
       if (quietAction === 'skip_turn') {
         this.queue = [];
+        emitMetric('skipped');
         this.options.onTrace?.('policy', 'info', '命中勿扰时段，已跳过本轮');
         this.show(this.shot ? 'scheduled' : 'listening');
         return;
@@ -477,6 +533,7 @@ export class ConversationActor {
           this.options.onTrace?.('policy', 'info', '命中勿扰时段，已降级为只拟稿');
         }
         this.queue = [];
+        emitMetric('draft');
         this.show(this.shot ? 'scheduled' : 'listening', 'draft-ready', { draft: outcome.text });
         this.draftTimer = setTimeout(() => {
           if (this.statusValue.draft) this.show(this.statusValue.phase);
@@ -491,16 +548,19 @@ export class ConversationActor {
         text: outcome.text, attemptId: this.options.transmitter.autoAttempt(this.peer, [...refs]),
         ...(messageRef && { messageRef }), ...(mentionUserIds && { mentionUserIds }),
         expectedIdentity: fence.identity, fenceCursor: fence, originGuard: 'live_or_human', origin: 'live', checkStillValid: check,
+        onTiming: timing => { sendTiming = timing; },
         onWire: () => {
           this.options.onTrace?.('send', 'info', '正在提交微信发信');
           if (this.revision === revision) this.show('sending');
         } });
       this.setReceipt(receipt);
       this.traceReceipt(receipt);
+      emitMetric(decision.action === 'identity' ? 'identity' : 'sent');
       this.queue = this.queue.filter(event => !refs.has(event.messageRef));
       if (this.grant && this.status.phase !== 'cooldown') this.show(this.shot ? 'scheduled' : 'listening');
     } catch (error) {
       const why = errorCode(error);
+      if (why !== 'turn-obsolete' && why !== 'stopped') emitMetric('failed', why);
       if (sending) this.traceSendFault(why);
       if (why === 'send-unknown' || why === 'peer-stopped') this.pause(why);
       else if (revision === this.revision && this.grant) {
