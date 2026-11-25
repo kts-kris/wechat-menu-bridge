@@ -40,6 +40,7 @@ enum WeChatMenuBridgeApp {
         item.autosaveName = "WeChatBridge"
         statusItem = item
         popover.delegate = self
+        #if compiler(>=6.4)
         if #available(macOS 27.0, *) {
             // 生命周期交给展开会话，避免 .transient 与会话重复关闭。
             popover.behavior = .applicationDefined
@@ -47,6 +48,9 @@ enum WeChatMenuBridgeApp {
         } else {
             popover.behavior = .transient
         }
+        #else
+        popover.behavior = .transient
+        #endif
         statusRightClick = NSEvent.addLocalMonitorForEvents(matching: .rightMouseUp) { [weak self] event in
             guard let self, let window = self.statusItem?.button?.window, event.window === window else { return event }
             self.showControls()
@@ -57,10 +61,15 @@ enum WeChatMenuBridgeApp {
             // a system process shared with other apps and the installed bridge.
             let qaID = NativeQA.home == nil ? nil : Bundle.main.bundleIdentifier
             button.setAccessibilityIdentifier(qaID.map { "bridge-status-\($0)" } ?? "bridge-status")
+            #if compiler(>=6.4)
             if #unavailable(macOS 27.0) {
                 button.target = self
                 button.action = #selector(togglePanel(_:))
             }
+            #else
+            button.target = self
+            button.action = #selector(togglePanel(_:))
+            #endif
             statusUpdates = Publishers.CombineLatest3(workspace.runtime.$globalPhase, workspace.sessions.$sessions, workspace.plugins.$states)
                 .sink { [weak self, weak button] phase, sessions, plugins in
                     guard let self else { return }
@@ -163,6 +172,7 @@ enum WeChatMenuBridgeApp {
 
     // .applicationDefined 不会自动关闭，系统头文件要求 App 自行检测外部点击。
     private func watchPanelDismissal() {
+        #if compiler(>=6.4)
         guard #available(macOS 27.0, *), panelMonitors.isEmpty else { return }
         let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         if let local = NSEvent.addLocalMonitorForEvents(matching: clicks.union(.keyDown), handler: { [weak self] event in
@@ -178,6 +188,7 @@ enum WeChatMenuBridgeApp {
         if let global = NSEvent.addGlobalMonitorForEvents(matching: clicks, handler: { [weak self] _ in
             self?.dismissPanel(forClickIn: nil)
         }) { panelMonitors.append(global) }
+        #endif
     }
 
     private func dismissPanel(forClickIn window: NSWindow?) {
@@ -195,7 +206,9 @@ enum WeChatMenuBridgeApp {
     func popoverDidClose(_ notification: Notification) {
         panelMonitors.forEach(NSEvent.removeMonitor)
         panelMonitors = []
+        #if compiler(>=6.4)
         if #available(macOS 27.0, *) { statusItem?.expandedInterfaceSession?.cancel() }
+        #endif
         // 真正关闭时才销毁视图及其待确认状态；关闭可能发生在按钮回调内，所以延后一拍。
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.popover.isShown else { return }
@@ -303,6 +316,7 @@ enum WeChatMenuBridgeApp {
     }
 }
 
+#if compiler(>=6.4)
 @available(macOS 27.0, *)
 extension BridgeEntry: @preconcurrency NSStatusItemExpandedInterfaceDelegate {
     func statusItem(_ statusItem: NSStatusItem, didBegin session: NSStatusItemExpandedInterfaceSession) {
@@ -319,6 +333,7 @@ extension BridgeEntry: @preconcurrency NSStatusItemExpandedInterfaceDelegate {
         if popover.isShown { popover.animates = animated; popover.close(); popover.animates = true }
     }
 }
+#endif
 
 enum MenuPanelMetrics {
     static let width: CGFloat = 336

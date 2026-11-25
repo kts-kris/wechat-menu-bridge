@@ -618,9 +618,10 @@ private enum UpdateRelauncher {
         posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
         posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
 
-        let argv: [UnsafeMutablePointer<CChar>?] = ([path] + arguments).map { strdup($0) } + [nil]
-        let home = "HOME=" + NSHomeDirectory()
-        let envp: [UnsafeMutablePointer<CChar>?] = ["PATH=/usr/bin:/bin:/usr/sbin:/sbin", home].map { strdup($0) } + [nil]
+        let argStrings: [String] = [path] + arguments
+        let argv: [UnsafeMutablePointer<CChar>?] = argStrings.map { strdup($0) } + [nil]
+        let envStrings: [String] = ["PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=" + NSHomeDirectory()]
+        let envp: [UnsafeMutablePointer<CChar>?] = envStrings.map { strdup($0) } + [nil]
         defer { (argv + envp).forEach { free($0) } }
         var pid: pid_t = 0
         guard posix_spawn(&pid, path, &actions, &attributes, argv, envp) == 0 else {
