@@ -5,7 +5,19 @@ import { modelPresetSchema, type ModelPreset } from '../contracts/settings.ts';
 import type { MediaBlock } from '../mcp/client.ts';
 import { CHAT_TIMEOUT_MS, ModelClient } from './client.ts';
 import type { ModelTiming, ModelTrace } from './request.ts';
-import { untilAborted } from './sse.ts';
+import { untilAborted, type TokenUsage } from './sse.ts';
+
+export function estimateTokenCostUsd(preset: Pick<ModelPreset, 'mode' | 'inputPricePerMillion' | 'cachedInputPricePerMillion' | 'outputPricePerMillion'> | undefined,
+  usage: TokenUsage | undefined): number {
+  if (!preset || preset.mode === 'local' || !usage) return 0;
+  const inputRate = preset.inputPricePerMillion ?? 0;
+  const cachedRate = preset.cachedInputPricePerMillion ?? inputRate;
+  const outputRate = preset.outputPricePerMillion ?? 0;
+  if (inputRate <= 0 && cachedRate <= 0 && outputRate <= 0) return 0;
+  const uncachedPrompt = Math.max(0, usage.promptTokens - usage.cachedTokens);
+  const raw = (uncachedPrompt * inputRate + usage.cachedTokens * cachedRate + usage.completionTokens * outputRate) / 1_000_000;
+  return Math.round(Math.max(0, raw) * 1_000_000) / 1_000_000;
+}
 
 type Priority = 'reply' | 'background';
 export type ModelRequest = {
@@ -154,7 +166,7 @@ export class ModelRouter {
       promptTokens: timing?.usage?.promptTokens ?? 0,
       cachedTokens: timing?.usage?.cachedTokens ?? 0,
       completionTokens: timing?.usage?.completionTokens ?? 0,
-      estimatedCostUsd: 0,
+      estimatedCostUsd: estimateTokenCostUsd(activePreset, timing?.usage),
     });
     const execute = async (preset: ModelPreset | undefined, request: ModelRequest, budget: number) => {
       const timeoutMs = Math.floor(started + budget - performance.now());

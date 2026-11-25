@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { ReplyModel } from '../model.ts';
 import { ModelClient, resetEndpointCapabilities } from '../src/llm/client.ts';
 import { requestModel } from '../src/llm/request.ts';
-import { ModelRouter } from '../src/llm/router.ts';
+import { estimateTokenCostUsd, ModelRouter } from '../src/llm/router.ts';
+import { modelPresetSchema } from '../src/contracts/settings.ts';
 import { extractJsonObject, extractTokenUsage, readCompletionContent } from '../src/llm/sse.ts';
 import { mockNetwork, syntheticText } from './fixture.ts';
 
@@ -435,4 +436,31 @@ test('v2.5 #36 usage 解析兼容 OpenAI/DeepSeek/Anthropic 缓存字段，SSE �
     expect(await clientB.chat(['hi2'], [])).toEqual({ action: 'skip' });
     expect(seen[3]?.stream_options).toBeUndefined();
   } finally { fetchStub.mockRestore(); resetEndpointCapabilities(); }
+});
+
+test('v2.5 #37 可选单价校验、费用估算精度与本机模型零计费', () => {
+  const cloudPreset = modelPresetSchema.parse({
+    id: 'p-cloud', name: 'Cloud', kind: 'chat', mode: 'cloud',
+    url: 'https://pricing.example.invalid/v1', modelName: 'gpt-5',
+    inputPricePerMillion: 2.0, cachedInputPricePerMillion: 0.2, outputPricePerMillion: 8.0,
+  });
+  // 未命中输入 200 * $2/1M = 0.0004, 缓存输入 800 * $0.2/1M = 0.00016, 输出 100 * $8/1M = 0.0008 => 0.00136
+  expect(estimateTokenCostUsd(cloudPreset, { promptTokens: 1000, cachedTokens: 800, completionTokens: 100 })).toBe(0.00136);
+  // 未配置缓存单价时按普通输入单价计费
+  const noCacheDiscount = modelPresetSchema.parse({
+    id: 'p-cloud-2', name: 'Cloud2', kind: 'chat', mode: 'cloud',
+    url: 'https://pricing.example.invalid/v1', modelName: 'gpt-5',
+    inputPricePerMillion: 1.0, outputPricePerMillion: 4.0,
+  });
+  expect(estimateTokenCostUsd(noCacheDiscount, { promptTokens: 1000, cachedTokens: 500, completionTokens: 250 })).toBe(0.002);
+  // 本机模型固定为 0，即使配置了单价也不计费
+  const localPreset = modelPresetSchema.parse({
+    id: 'p-local', name: 'Local', kind: 'chat', mode: 'local',
+    url: 'http://127.0.0.1:11434/v1', modelName: 'qwen',
+    inputPricePerMillion: 5.0,
+  });
+  expect(estimateTokenCostUsd(localPreset, { promptTokens: 1000, cachedTokens: 500, completionTokens: 100 })).toBe(0);
+  // 负数或超出上限的单价被严格拒绝
+  expect(modelPresetSchema.safeParse({ ...cloudPreset, inputPricePerMillion: -1 }).success).toBe(false);
+  expect(modelPresetSchema.safeParse({ ...cloudPreset, outputPricePerMillion: 10_001 }).success).toBe(false);
 });

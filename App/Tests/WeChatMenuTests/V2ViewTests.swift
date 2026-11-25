@@ -1870,6 +1870,11 @@ final class V2ViewTests: XCTestCase {
         XCTAssertEqual(PerfStage.allCases.count, 6)
         XCTAssertEqual(PerfFormat.duration(850), "850ms")
         XCTAssertEqual(PerfFormat.duration(1852), "1.85s")
+        XCTAssertEqual(PerfFormat.tokens(650), "650")
+        XCTAssertEqual(PerfFormat.tokens(12_450), "12.4k")
+        XCTAssertEqual(PerfFormat.costUsd(0), "—")
+        XCTAssertEqual(PerfFormat.costUsd(0.0014), "$0.0014")
+        XCTAssertEqual(PerfFormat.costUsd(0.125), "$0.125")
 
         let (workspace, _) = try makeWorkspace(connected: true)
         seededSettings(workspace)
@@ -1881,11 +1886,14 @@ final class V2ViewTests: XCTestCase {
             ingestMs: 40, debounceMs: 260, promptMs: 12, promptCacheHit: true,
             modelTtftMs: 4200, modelTotalMs: 5300, fenceMs: 180, sendWireMs: 90,
             totalMs: 5882, bottleneck: .modelTtft, modelMode: .cloud, effort: .max,
-            fallbackUsed: false, errorCode: nil
+            fallbackUsed: false, errorCode: nil,
+            presetId: "p-cloud", modelName: "gpt-5",
+            promptTokens: 2000, cachedTokens: 1600, completionTokens: 80, estimatedCostUsd: 0.0024
         )
         let populated = SystemMetricsResult(
             windowHours: 24, sampleCount: 3, slowCount: 1, slowThresholdMs: 5000, promptCacheHitCount: 2,
             total: .init(p50Ms: 2100, p95Ms: 5882, maxMs: 5882, avgMs: 3100),
+            tokens: .init(promptTokens: 3500, cachedTokens: 2600, completionTokens: 180, kvCacheHitRate: 74, estimatedCostUsd: 0.0036),
             primaryBottleneck: .modelTtft,
             stages: [
                 .init(stage: .ingest, p50Ms: 30, p95Ms: 40, avgMs: 32, sharePercent: 1, bottleneckCount: 0),
@@ -1895,28 +1903,63 @@ final class V2ViewTests: XCTestCase {
                 .init(stage: .modelGen, p50Ms: 350, p95Ms: 1100, avgMs: 520, sharePercent: 17, bottleneckCount: 0),
                 .init(stage: .send, p50Ms: 160, p95Ms: 270, avgMs: 222, sharePercent: 7, bottleneckCount: 0),
             ],
+            byPreset: [
+                .init(presetId: "p-cloud", modelName: "gpt-5", mode: .cloud, turns: 2,
+                      p50TotalMs: 2800, p95TotalMs: 5882, p50TtftMs: 1800,
+                      promptTokens: 2500, cachedTokens: 2000, completionTokens: 120, kvCacheHitRate: 80, estimatedCostUsd: 0.0036),
+                .init(presetId: "p-local", modelName: "qwen-local", mode: .local, turns: 1,
+                      p50TotalMs: 720, p95TotalMs: 720, p50TtftMs: 240,
+                      promptTokens: 1000, cachedTokens: 600, completionTokens: 60, kvCacheHitRate: 60, estimatedCostUsd: 0),
+            ],
             recent: [slowSample]
         )
 
         let filledView = Form {
             PerformanceMonitorSection(workspace: workspace, overrideMetrics: populated, showRecent: true)
         }.formStyle(.grouped)
-        let filledLight = try snapshot(filledView, appearance: .aqua, size: CGSize(width: 680, height: 680))
-        let filledDark = try snapshot(filledView, appearance: .darkAqua, size: CGSize(width: 680, height: 680))
+        let filledLight = try snapshot(filledView, appearance: .aqua, size: CGSize(width: 680, height: 860))
+        let filledDark = try snapshot(filledView, appearance: .darkAqua, size: CGSize(width: 680, height: 860))
         XCTAssertNotEqual(emptyLight, filledLight)
         XCTAssertNotEqual(filledLight, filledDark)
 
-        // 诊断报告自动附带脱敏性能画像，绝不携带聊天正文或凭据。
+        // 云端模型预设单价表单校验与渲染
+        var cloudForm = PresetForm()
+        cloudForm.name = "云端测试"
+        cloudForm.mode = .cloud
+        cloudForm.url = "https://pricing.example.invalid/v1"
+        cloudForm.modelName = "gpt-5"
+        cloudForm.inputPriceText = "-1"
+        XCTAssertFalse(cloudForm.issues.isEmpty)
+        cloudForm.inputPriceText = "1.25"
+        cloudForm.cachedInputPriceText = "0.125"
+        cloudForm.outputPriceText = "10"
+        XCTAssertTrue(cloudForm.issues.isEmpty)
+        let builtPreset = cloudForm.build()
+        XCTAssertEqual(builtPreset.inputPricePerMillion, 1.25)
+        XCTAssertEqual(builtPreset.cachedInputPricePerMillion, 0.125)
+        XCTAssertEqual(builtPreset.outputPricePerMillion, 10)
+        _ = try snapshot(PresetEditor(workspace: workspace, initial: cloudForm, dismiss: {}),
+                         appearance: .aqua, size: CGSize(width: 560, height: 520))
+
+        // 诊断报告自动附带脱敏性能与 Token/KV 缓存画像，绝不携带聊天正文、预设地址或凭据。
         var snap = DiagnosticSnapshot.capture(workspace)
         snap.perfSummary = .init(
             windowHours: 24, sampleCount: 3, slowCount: 1,
             p50Ms: 2100, p95Ms: 5882, maxMs: 5882,
             primaryBottleneck: .modelTtft,
-            stageShares: populated.stages.map { ($0.stage, $0.sharePercent, $0.p50Ms, $0.p95Ms) }
+            stageShares: populated.stages.map { ($0.stage, $0.sharePercent, $0.p50Ms, $0.p95Ms) },
+            promptTokens: 3500, cachedTokens: 2600, completionTokens: 180, kvCacheHitRate: 74, estimatedCostUsd: 0.0036,
+            presets: populated.byPreset.map {
+                .init(mode: $0.mode, turns: $0.turns, p50TotalMs: $0.p50TotalMs, p50TtftMs: $0.p50TtftMs,
+                      kvCacheHitRate: $0.kvCacheHitRate, totalTokens: $0.promptTokens + $0.completionTokens,
+                      estimatedCostUsd: $0.estimatedCostUsd)
+            }
         )
         let report = DiagnosticBundleBuilder.buildReport(snapshot: snap, logLines: [])
         XCTAssertTrue(report.contains("## 性能画像（最近 24 小时，3 轮）"))
         XCTAssertTrue(report.contains("当前主瓶颈：模型首包 (TTFT)（model_ttft）"))
         XCTAssertTrue(report.contains("P50 2100ms · P95 5882ms"))
+        XCTAssertTrue(report.contains("Token 用量：输入 3500（KV 缓存命中 2600 / 74%）· 输出 180 · 估算费用 $0.0036"))
+        XCTAssertTrue(report.contains("预设 #1（cloud）：2 轮 · 首包 P50 1800ms · 总耗 P50 2800ms · KV 80%"))
     }
 }
