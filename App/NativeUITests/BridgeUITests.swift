@@ -5,12 +5,12 @@ import XCTest
 // v2.1 five-pane console. Every case runs a disposable, re-signed copy under
 // scripts/uitest.sh; network peers are the synthetic fixture only.
 final class BridgeUITests: XCTestCase {
-    private static let tabs: [(id: String, title: String, marker: String)] = [
-        ("overview", "概览与动态", "只看未读"),
-        ("conversations", "会话与策略", "conversation-add"),
-        ("plugins", "后链路插件", "plugin-create-digest"),
-        ("memory", "人格与记忆", "persona-auto-merge"),
-        ("settings", "连接与设置", "mcp-url"),
+    private static let tabs: [(id: String, title: String, subtitle: String, marker: String)] = [
+        ("overview", "概览与动态", "运行状态、异常恢复和插件产出", "只看未读"),
+        ("conversations", "会话与策略", "每个会话独立管理回复与风控", "conversation-add"),
+        ("plugins", "后链路插件", "只读消息的提炼与归集", "plugin-create-digest"),
+        ("memory", "人格与记忆", "人格档案、联系人专档与待审建议", "persona-auto-merge"),
+        ("settings", "连接与设置", "修改保存后才会生效", "mcp-url"),
     ]
 
     @MainActor
@@ -103,7 +103,11 @@ final class BridgeUITests: XCTestCase {
 
         try enter(mcp, into: control("mcp-url", in: console))
         try click(control("mcp-probe", in: console))
-        try select(in: run.app, popUp: console.popUpButtons["账号"], option: "模拟账号")
+        let accountPicker = console.popUpButtons.matching(
+            NSPredicate(format: "identifier == %@ OR label == %@ OR title == %@ OR value == %@",
+                        "mcp-account", "账号", "模拟账号", "模拟账号")
+        ).firstMatch
+        try select(in: run.app, popUp: accountPicker, option: "模拟账号")
         XCTAssertTrue(console.staticTexts["模拟账号"].waitForExistence(timeout: 5), "Selected account must be shown")
 
         try click(control("preset-add", in: console), in: form)
@@ -122,10 +126,13 @@ final class BridgeUITests: XCTestCase {
         try waitForSaved(in: console)
         let preview = control("model-preview", in: console)
         try click(preview, in: form)
-        XCTAssertTrue(console.staticTexts["会回复"].waitForExistence(timeout: 8), "Missing preview result; \(console.debugDescription)")
-        XCTAssertTrue(console.staticTexts["哈哈，那挺好"].exists)
-        let previewed = try await fixture.request()
-        XCTAssertEqual(previewed.models, 1)
+        let previewed = try await waitForPreview(fixture: fixture)
+        XCTAssertEqual(previewed.models, 1, "Clicking 「本机试拟」 must call the local fixture model once")
+        form.scroll(byDeltaX: 0, deltaY: -240)
+        let replyPill = console.staticTexts["会回复"]
+        XCTAssertTrue(replyPill.waitForExistence(timeout: 8),
+                      "Missing preview result; texts=\(console.staticTexts.allElementsBoundByIndex.prefix(40).map(textValue))")
+        XCTAssertTrue(console.staticTexts["哈哈，那挺好"].waitForExistence(timeout: 4))
         XCTAssertEqual(previewed.sends, 0, "A preview never sends a WeChat message")
         XCTAssertEqual(previewed.faults, 0)
         try run.stop()
@@ -138,7 +145,7 @@ final class BridgeUITests: XCTestCase {
         XCTAssertEqual(control("mcp-url", in: console).value as? String, mcp, "MCP address must survive a restart")
         XCTAssertTrue(console.staticTexts["模拟账号"].waitForExistence(timeout: 5), "Account must survive a restart")
         XCTAssertTrue(console.staticTexts[row].waitForExistence(timeout: 5), "Model preset must survive a restart")
-        XCTAssertEqual(control("settings-dirty-state", in: console).label, "设置已保存")
+        XCTAssertEqual(textValue(control("settings-dirty-state", in: console)), "设置已保存")
         let restarted = control("model-preview", in: console)
         try scrollIntoView(restarted, in: form)
         XCTAssertTrue(restarted.isEnabled, "「模型试拟」 must stay usable after a restart")
@@ -156,7 +163,11 @@ final class BridgeUITests: XCTestCase {
         let console = try run.controls()
         try click(control("console-tab-conversations", in: console))
         try assertShowing("conversations", in: console)
-        let row = console.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH %@", "模拟联系人")).firstMatch
+        // ConversationRow combines its avatar initial ("模") ahead of the label;
+        // on macOS SwiftUI StaticText exposes combined text in value or label.
+        let row = console.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "模拟联系人", "模拟联系人")
+        ).firstMatch
         try click(row)
         let draft = control("conversation-draft", in: console), auto = control("conversation-auto", in: console)
         XCTAssertTrue(draft.waitForExistence(timeout: 6), "The seeded conversation did not open; \(console.debugDescription)")
@@ -214,26 +225,46 @@ final class BridgeUITests: XCTestCase {
         console.scrollViews.containing(.any, identifier: "mcp-url").firstMatch
     }
 
-    // The window title follows the pane (macOS 14+ bridges navigationTitle) and
-    // only the selected pane's own control exists.
+    // The window title follows the pane (macOS 14+ bridges navigationTitle and
+    // joins navigationSubtitle with an en-dash) and only the selected pane's
+    // own control exists.
     @MainActor private func assertShowing(_ id: String, in console: XCUIElement) throws {
         let tab = try XCTUnwrap(Self.tabs.first { $0.id == id })
         let marker = id == "overview" ? console.checkBoxes[tab.marker] : control(tab.marker, in: console)
         XCTAssertTrue(marker.waitForExistence(timeout: 6), "Pane \(tab.title) did not show; \(console.debugDescription)")
+        let expectedTitles = [tab.title, "\(tab.title) – \(tab.subtitle)"]
         let deadline = Date.now.addingTimeInterval(5)
-        while console.title != tab.title && Date.now < deadline { RunLoop.current.run(until: Date.now.addingTimeInterval(0.1)) }
-        XCTAssertEqual(console.title, tab.title, "Window title must follow the selected pane")
+        while !expectedTitles.contains(console.title) && Date.now < deadline {
+            RunLoop.current.run(until: Date.now.addingTimeInterval(0.1))
+        }
+        XCTAssertTrue(expectedTitles.contains(console.title),
+                      "Window title '\(console.title)' must match '\(tab.title)' (or with subtitle)")
         for other in Self.tabs where other.id != id {
             let element = other.id == "overview" ? console.checkBoxes[other.marker] : control(other.marker, in: console)
             XCTAssertFalse(element.exists, "\(other.title) content still visible on \(tab.title)")
         }
     }
 
+    @MainActor private func textValue(_ element: XCUIElement) -> String {
+        if let value = element.value as? String, !value.isEmpty { return value }
+        return element.label
+    }
+
+    @MainActor private func waitForPreview(fixture: UIFixture) async throws -> UIFixture.Counts {
+        let deadline = Date.now.addingTimeInterval(8)
+        var counts = try await fixture.request()
+        while counts.models == 0 && Date.now < deadline {
+            try await Task.sleep(nanoseconds: 150_000_000)
+            counts = try await fixture.request()
+        }
+        return counts
+    }
+
     @MainActor private func waitForSaved(in console: XCUIElement) throws {
         let state = control("settings-dirty-state", in: console)
         let deadline = Date.now.addingTimeInterval(8)
-        while state.label != "设置已保存" && Date.now < deadline { RunLoop.current.run(until: Date.now.addingTimeInterval(0.1)) }
-        XCTAssertEqual(state.label, "设置已保存", "Settings were not saved; \(console.debugDescription)")
+        while textValue(state) != "设置已保存" && Date.now < deadline { RunLoop.current.run(until: Date.now.addingTimeInterval(0.1)) }
+        XCTAssertEqual(textValue(state), "设置已保存", "Settings were not saved; \(console.debugDescription)")
     }
 
     @MainActor private func scrollIntoView(_ element: XCUIElement, in scroll: XCUIElement) throws {
@@ -250,8 +281,27 @@ final class BridgeUITests: XCTestCase {
 
     @MainActor private func enter(_ text: String, into field: XCUIElement) throws {
         try click(field)
+        let pasteboard = NSPasteboard.general
+        let saved: [[NSPasteboard.PasteboardType: Data]] = (pasteboard.pasteboardItems ?? []).map { item in
+            Dictionary(uniqueKeysWithValues: item.types.compactMap { type in
+                item.data(forType: type).map { (type, $0) }
+            })
+        }
+        defer {
+            pasteboard.clearContents()
+            if !saved.isEmpty {
+                let items = saved.map { dict -> NSPasteboardItem in
+                    let item = NSPasteboardItem()
+                    for (type, data) in dict { item.setData(data, forType: type) }
+                    return item
+                }
+                pasteboard.writeObjects(items)
+            }
+        }
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
         field.typeKey("a", modifierFlags: .command)
-        field.typeText(text)
+        field.typeKey("v", modifierFlags: .command)
         XCTAssertEqual(field.value as? String, text, "Text entered in \(field)")
     }
 
@@ -381,8 +431,7 @@ final class BridgeUITests: XCTestCase {
         XCTAssertFalse(exit.exists, "The menu panel must be opened by a status-item click")
         if hosted {
             XCTAssertFalse(app.windows["微信桥控制台"].exists, "A console must not substitute for the menu bar")
-            let item = try hostedStatusItem()
-            item.click()
+            try clickHostedStatusItem()
         } else {
             try clickLocallyHostedStatusItem()
         }
@@ -392,18 +441,59 @@ final class BridgeUITests: XCTestCase {
         return surface
     }
 
-    private func hostedStatusItem() throws -> XCUIElement {
+    private func clickHostedStatusItem() throws {
         let identity = NSPredicate(format: "identifier == %@ OR label BEGINSWITH %@", "bridge-status-\(id)", "微信桥验收 \(id) · ")
         // The compositor and accessibility publisher may be different
-        // processes. Neither an offscreen proxy nor a different app is safe.
-        let ownerItem = app.descendants(matching: .any).matching(identity).firstMatch
+        // processes, and multi-display setups publish one item per display.
+        // Neither an offscreen proxy nor a different app is safe.
+        let ownerQuery = app.descendants(matching: .any).matching(identity)
         let host = XCUIApplication(bundleIdentifier: Self.menuBarAgent)
-        let item = host.descendants(matching: .any).matching(identity).firstMatch
-        if item.waitForExistence(timeout: 5), item.isHittable { return item }
-        if ownerItem.exists, ownerItem.isHittable { return ownerItem }
+        let hostQuery = host.descendants(matching: .any).matching(identity)
+        var deadline = Date.now.addingTimeInterval(6)
+        let start = Date.now
+        var expandedOverflow = false
+        repeat {
+            let hostItems = hostQuery.allElementsBoundByIndex.filter(\.exists)
+            let ownerItems = ownerQuery.allElementsBoundByIndex.filter(\.exists)
+            for candidate in hostItems where candidate.isHittable {
+                candidate.click()
+                return
+            }
+            for candidate in ownerItems where candidate.isHittable {
+                candidate.click()
+                return
+            }
+            // On macOS 27, once MenuBarAgent's overflow bar is expanded, both the
+            // isolated app and MenuBarAgent publish the exact same on-screen frame
+            // for our UUID-tagged button even though cross-process hit-testing
+            // reports isHittable == false. Click the verified shared frame center.
+            if expandedOverflow,
+               let hostMatch = hostItems.first(where: { $0.isEnabled && $0.frame.minX > 0 && $0.frame.minY >= 0 && !$0.frame.isEmpty }),
+               ownerItems.contains(where: { $0.frame == hostMatch.frame }) {
+                hostMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+                return
+            }
+            // macOS 27 MenuBarAgent collapses excess status items behind its own
+            // overflow button (and may omit them from AX until expanded). Expand
+            // that system button once if our item has not surfaced after startup.
+            if !expandedOverflow,
+               !hostItems.isEmpty || Date.now.timeIntervalSince(start) >= 1.5 {
+                let overflow = host.buttons["menu-bar-overflow-indicator"]
+                if overflow.exists && overflow.isHittable {
+                    overflow.click()
+                    expandedOverflow = true
+                    deadline = max(deadline, Date.now.addingTimeInterval(5))
+                }
+            }
+            RunLoop.current.run(until: Date.now.addingTimeInterval(0.2))
+        } while Date.now < deadline
 
-        let ownerDetail = ownerItem.exists ? "frame \(ownerItem.frame)" : "not found"
-        let hostDetail = item.exists ? "frame \(item.frame), enabled \(item.isEnabled), \(hitDiagnostic(item.frame))" : "not found"
+        let ownerItems = ownerQuery.allElementsBoundByIndex.filter(\.exists)
+        let hostItems = hostQuery.allElementsBoundByIndex.filter(\.exists)
+        let ownerDetail = ownerItems.isEmpty ? "not found" : ownerItems.map { "frame \($0.frame)" }.joined(separator: "; ")
+        let hostDetail = hostItems.isEmpty ? "not found" : hostItems.map {
+            "frame \($0.frame), enabled \($0.isEnabled), \(hitDiagnostic($0.frame))"
+        }.joined(separator: "; ")
         throw LifecycleFault("Neither app nor MenuBarAgent has a hittable isolated status item (app: \(ownerDetail); MenuBarAgent: \(hostDetail)). No fallback click was sent.")
     }
 
