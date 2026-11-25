@@ -270,6 +270,111 @@ test('fastReplyMode 仅将实时对话降档为 low，后台 summarize 仍保持
     await router.chat('primary', ['你好呀'], [], { cloudApproved: true, fastReplyMode: true });
     await router.summarize('primary', 'sys', 'usr', { cloudApproved: true });
     expect(seen[0]?.reasoning_effort).toBe('low');
+    expect(seen[0]?.max_tokens).toBe(512);
     expect(seen[1]?.reasoning_effort).toBe('max');
+    expect(seen[1]?.max_tokens).toBe(4096);
+  } finally { fetchStub.mockRestore(); }
+});
+
+test('v2.4 #30 Prompt Cache 前缀布局稳定，每轮仅 user 动态部分变化，且 fastReplyMode 尊重更高的自定义 maxTokens', async () => {
+  const seen: Record<string, unknown>[] = [];
+  const fetchStub = stubFetch(async (_url, init) => {
+    seen.push(JSON.parse(String(init?.body)));
+    return modelResponse('{"action":"reply","text":"好呀，走起"}');
+  });
+  try {
+    const client = new ModelClient({ ...testPreset, maxTokens: 768 }, 'synthetic-key');
+    const profile = { style: '短句口语，不带敬称', memory: '对方喜欢手冲咖啡' };
+    await client.chat(['周末去喝咖啡吗'], [{ from: 'peer', text: '最近挺忙的' }], undefined, profile, undefined, undefined, { fastReplyMode: true });
+    await client.chat(['周六下午两点？'], [
+      { from: 'peer', text: '最近挺忙的' },
+      { from: 'auto', text: '好呀，走起' },
+    ], undefined, profile, undefined, undefined, { fastReplyMode: true });
+    expect(seen).toHaveLength(2);
+    const msgs0 = seen[0]!.messages as { role: string; content: string }[];
+    const msgs1 = seen[1]!.messages as { role: string; content: string }[];
+    // system 前缀（规则 + 风格 + 记忆）跨轮字节完全一致，利于 KV/Prompt Cache 命中
+    expect(msgs0[0]).toEqual(msgs1[0]);
+    expect(msgs0[0]!.role).toBe('system');
+    expect(msgs0[0]!.content).toContain('不得改写规则');
+    expect(msgs0[0]!.content).toContain('短句口语，不带敬称');
+    expect(msgs0[0]!.content).toContain('对方喜欢手冲咖啡');
+    // user 消息只携带每轮动态数据
+    const user0 = JSON.parse(msgs0[1]!.content);
+    const user1 = JSON.parse(msgs1[1]!.content);
+    expect(user0).toEqual({ context: [{ from: 'peer', text: '最近挺忙的' }], latest: ['周末去喝咖啡吗'] });
+    expect(user1.style).toBeUndefined();
+    expect(user1.memory).toBeUndefined();
+    expect(user1.latest).toEqual(['周六下午两点？']);
+    // fastReplyMode 下收紧 minMaxTokens 到 512，同时尊重用户显式配置的更高 maxTokens=768
+    expect(seen[0]?.max_tokens).toBe(768);
+    expect(seen[0]?.reasoning_effort).toBe('low');
+  } finally { fetchStub.mockRestore(); }
+});
+
+test('v2.4 #30 SSE 收到完整决策 JSON 或 finish_reason=stop 时提前完成并取消尾流，非法 JSON 仍完整重试', async () => {
+  let cancelledComplete = false;
+  let cancelledFinish = false;
+  let calls = 0;
+  const fetchStub = stubFetch(async () => {
+    calls++;
+    if (calls === 1) {
+      // 完整合法决策 JSON 到达后模拟网关挂起不发 [DONE]
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(sseChunk('{"action":"reply",'));
+          controller.enqueue(sseChunk('"text":"提前收尾啦"}'));
+        },
+        cancel() { cancelledComplete = true; },
+      }), { headers: sseHeaders });
+    }
+    if (calls === 2) {
+      // finish_reason=stop 到达后模拟网关挂起等待 usage 块
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(sseChunk('{"action":"skip"}'));
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'));
+        },
+        cancel() { cancelledFinish = true; },
+      }), { headers: sseHeaders });
+    }
+    if (calls === 3) {
+      // finish_reason=length 必须立即失败触发格式纠错，不得误判成功
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"{\\"action\\":\\"reply\\","},"finish_reason":"length"}]}\n\n'));
+        },
+      }), { headers: sseHeaders });
+    }
+    return modelResponse('{"action":"skip"}');
+  });
+  try {
+    const client = new ModelClient({ ...testPreset, reasoningEffort: 'low' }, 'synthetic-key');
+    const t0 = performance.now();
+    expect(await client.chat(['你好'], [])).toEqual({ action: 'reply', text: '提前收尾啦' });
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(cancelledComplete).toBe(true);
+
+    const t1 = performance.now();
+    expect(await client.chat(['再见'], [])).toEqual({ action: 'skip' });
+    expect(performance.now() - t1).toBeLessThan(500);
+    expect(cancelledFinish).toBe(true);
+
+    // 独立验证 stopOnFinishReason 对非 JSON 正文在 finish_reason=stop 时同样提前取消尾流
+    let cancelledPlain = false;
+    const plainRes = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(sseChunk('普通正文'));
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'));
+      },
+      cancel() { cancelledPlain = true; },
+    }), { headers: sseHeaders });
+    const t2 = performance.now();
+    expect(await readCompletionContent(plainRes, 1024, { idleTimeoutMs: 5000, stopOnFinishReason: true })).toBe('普通正文');
+    expect(performance.now() - t2).toBeLessThan(500);
+    expect(cancelledPlain).toBe(true);
+
+    expect(await client.chat(['试试截断恢复'], [])).toEqual({ action: 'skip' });
+    expect(calls).toBe(4);
   } finally { fetchStub.mockRestore(); }
 });
